@@ -90,7 +90,7 @@ def save_results(file_path: str, result: dict, transcript: str, stats: dict):
 def main():
     parser = argparse.ArgumentParser(description="Meeting Transcriber - 회의 음성 전사 도구")
     parser.add_argument("audio_file", help="전사할 오디오 파일 경로")
-    parser.add_argument("--language", default="ko-KR", help="언어 설정 (기본: ko-KR)")
+    parser.add_argument("--language", default="enko", help="언어 설정 (기본: ko-KR)")
     parser.add_argument("--disable-diarization", action="store_true", help="화자 분리 비활성화")
     parser.add_argument("--disable-noise-filtering", action="store_true", help="노이즈 필터링 비활성화")
     parser.add_argument("--enable-sed", action="store_true", help="음향 이벤트 탐지 활성화")
