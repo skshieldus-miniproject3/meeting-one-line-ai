@@ -57,6 +57,9 @@ outputs/
 temp/
 *.tmp
 
+# Embeddings storage
+embeddings/
+
 # Test files
 test_*.py
 *_test.py
