@@ -481,3 +481,28 @@ class ReportGenerator:
 개선 제안:
 """
         return self._call_llm(system_prompt, user_prompt, temperature=0.4)
+
+    # --- [임베딩 기능] ---
+
+    def generate_embedding(self, text: str) -> list[float]:
+        """
+        텍스트를 임베딩 벡터로 변환합니다.
+
+        Args:
+            text: 임베딩으로 변환할 텍스트
+
+        Returns:
+            1536개의 실수로 이루어진 임베딩 벡터
+
+        Raises:
+            ReportGeneratorError: 임베딩 생성 실패 시
+        """
+        try:
+            response = self.client.embeddings.create(
+                model="text-embedding-3-small",
+                input=text
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            self.logger.error(f"임베딩 생성 오류: {e}")
+            raise ReportGeneratorError(f"임베딩 생성 중 오류가 발생했습니다: {e}")

@@ -23,6 +23,7 @@ from src.core.formatter import (
     generate_meeting_summary_header
 )
 from src.core.ai_analyzer import ReportGenerator, ReportGeneratorError
+from src.core.embedding_manager import EmbeddingManager
 from dotenv import load_dotenv
 
 
@@ -245,6 +246,30 @@ def save_analysis_results(input_file: str, transcript: str, analysis_results: di
         }, f, indent=2, ensure_ascii=False)
     print(f"[분석 데이터 저장: {json_file}")
 
+    # 임베딩 저장 (요약이 있는 경우)
+    if 'summary' in analysis_results:
+        try:
+            print("\n[임베딩 생성 및 저장 중...")
+            generator = ReportGenerator()
+            embedding_manager = EmbeddingManager()
+
+            meeting_id = base_name
+            title = Path(input_file).stem
+            summary = analysis_results['summary']
+
+            # 임베딩 생성 및 저장
+            embedding = generator.generate_embedding(summary)
+            embedding_manager.save_meeting_embedding(
+                meeting_id=meeting_id,
+                title=title,
+                summary=summary,
+                embedding=embedding
+            )
+
+            print(f"[OK] 임베딩 저장 완료: {meeting_id}")
+        except Exception as e:
+            print(f"[WARNING] 임베딩 저장 실패: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Meeting Analyzer - AI 기반 회의 분석 도구")
@@ -339,11 +364,11 @@ def main():
     print("="*50)
 
     for analysis_type, result in analysis_results.items():
-        print(f"\n� {analysis_type.upper()}:")
+        print(f"\n[{analysis_type.upper()}]:")
         preview = result[:200] + "..." if len(result) > 200 else result
         print(preview)
 
-    print(f"\n� 전체 분석 보고서가 'outputs/' 디렉토리에 저장되었습니다.")
+    print(f"\n[INFO] 전체 분석 보고서가 'outputs/' 디렉토리에 저장되었습니다.")
     return 0
 
 

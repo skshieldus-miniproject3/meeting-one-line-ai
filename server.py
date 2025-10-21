@@ -34,6 +34,7 @@ from src.core.formatter import (
 )
 # ai_analyzer는 DB와 무관하므로 그대로 사용
 from src.core.ai_analyzer import ReportGenerator, ReportGeneratorError
+from src.core.embedding_manager import EmbeddingManager
 
 # .env 로드
 load_dotenv()
@@ -66,6 +67,9 @@ try:
     report_generator = ReportGenerator()
 except Exception:
     report_generator = None
+
+# 임베딩 관리자
+embedding_manager = EmbeddingManager(embeddings_dir="embeddings")
 
 # 작업 상태 저장소 (실제 환경에서는 Redis 등 사용)
 job_store: Dict[str, Dict[str, Any]] = {}
@@ -117,6 +121,12 @@ class SummaryRequest(BaseModel):
     summary_type: str = "summary" # 병합된 모든 AI 타입 포함
 
 
+class SemanticSearchRequest(BaseModel):
+    """의미 검색 요청 모델"""
+    query: str
+    top_k: int = 5
+
+
 class JobResponse(BaseModel):
     """작업 응답 모델"""
     job_id: str
@@ -130,7 +140,7 @@ async def root():
     """루트 엔드포인트"""
     return {
         "service": "CLOVA Speech STT API",
-        "version": "1.3.0", # 버전 업데이트
+        "version": "1.4.0", # 버전 업데이트 (임베딩 검색 추가)
         "endpoints": [
             "/stt/url",
             "/stt/file",
@@ -140,6 +150,8 @@ async def root():
             "/transcript/summarize",
             "/transcript/statistics",
             "/upload_and_analyze", # [수정] DB 저장 기능 없음
+            "/search/semantic",  # 임베딩 의미 검색
+            "/embeddings/stats",  # 임베딩 통계
             # "/history" # [삭제] DB 조회 엔드포인트 제거
         ]
     }
@@ -526,6 +538,130 @@ async def upload_and_analyze(
 # --- [DB 연동 제거] ---
 # @app.get("/history", ...) 엔드포인트 제거
 # -----------------------
+
+
+# ========================================
+# 임베딩 검색 API
+# ========================================
+
+@app.post("/search/semantic")
+async def semantic_search(request: SemanticSearchRequest):
+    """
+    의미 기반 회의록 검색
+
+    요청:
+        - query: 검색 쿼리 (예: "예산 관련 회의")
+        - top_k: 반환할 결과 개수 (기본: 5)
+
+    응답:
+        - results: 유사도 높은 순으로 정렬된 회의록 목록
+    """
+    if not report_generator:
+        raise HTTPException(status_code=500, detail="OpenAI API 키가 설정되지 않았습니다")
+
+    try:
+        # 1. 검색 쿼리를 임베딩으로 변환
+        query_embedding = report_generator.generate_embedding(request.query)
+
+        # 2. 유사한 회의록 검색
+        results = embedding_manager.search_similar_meetings(
+            query_embedding=query_embedding,
+            top_k=request.top_k
+        )
+
+        return {
+            "query": request.query,
+            "total_results": len(results),
+            "results": results
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"검색 실패: {str(e)}")
+
+
+@app.get("/embeddings/stats")
+async def get_embedding_stats():
+    """
+    저장된 임베딩 통계 정보 조회
+
+    응답:
+        - total_meetings: 총 회의록 개수
+        - storage_path: 저장 경로
+        - meetings: 회의록 목록
+    """
+    try:
+        stats = embedding_manager.get_stats()
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"통계 조회 실패: {str(e)}")
+
+
+@app.post("/embeddings/save")
+async def save_meeting_embedding(
+    meeting_id: str = Form(...),
+    title: str = Form(...),
+    summary: str = Form(...)
+):
+    """
+    회의록 임베딩 생성 및 저장
+
+    요청:
+        - meeting_id: 회의 ID
+        - title: 회의 제목
+        - summary: 회의 요약
+
+    응답:
+        - message: 성공 메시지
+        - meeting_id: 저장된 회의 ID
+    """
+    if not report_generator:
+        raise HTTPException(status_code=500, detail="OpenAI API 키가 설정되지 않았습니다")
+
+    try:
+        # 1. 요약 텍스트를 임베딩으로 변환
+        embedding = report_generator.generate_embedding(summary)
+
+        # 2. 임베딩 저장
+        embedding_manager.save_meeting_embedding(
+            meeting_id=meeting_id,
+            title=title,
+            summary=summary,
+            embedding=embedding
+        )
+
+        return {
+            "message": "임베딩 저장 완료",
+            "meeting_id": meeting_id
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"임베딩 저장 실패: {str(e)}")
+
+
+@app.delete("/embeddings/{meeting_id}")
+async def delete_meeting_embedding(meeting_id: str):
+    """
+    회의록 임베딩 삭제
+
+    경로 파라미터:
+        - meeting_id: 삭제할 회의 ID
+
+    응답:
+        - message: 성공/실패 메시지
+    """
+    try:
+        success = embedding_manager.delete_meeting_embedding(meeting_id)
+
+        if success:
+            return {"message": f"임베딩 삭제 완료: {meeting_id}"}
+        else:
+            raise HTTPException(status_code=404, detail=f"임베딩을 찾을 수 없습니다: {meeting_id}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"임베딩 삭제 실패: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
