@@ -60,18 +60,11 @@ class ReportGenerator:
             self.logger.error(f"OpenAI API 호출 오류: {e}")
             raise ReportGeneratorError(f"LLM 호출 중 오류가 발생했습니다: {e}")
 
+    # --- [기존 5개 기능] ---
+
     def summarize(self, transcript: str) -> str:
         """
-        대화록 텍스트를 핵심 요약합니다.
-
-        Args:
-            transcript: 대화록 텍스트 (화자별로 구분된 형태)
-
-        Returns:
-            요약된 텍스트
-
-        Raises:
-            ReportGeneratorError: 요약 생성 실패 시
+        대화록 텍스트를 핵심 요약합니다. (기존 기능)
         """
         self.logger.info("대화록 요약 생성 중...")
 
@@ -96,16 +89,7 @@ class ReportGenerator:
 
     def generate_meeting_notes(self, transcript: str) -> str:
         """
-        대화록을 바탕으로 공식 회의록 문서를 생성합니다.
-
-        Args:
-            transcript: 대화록 텍스트 (화자별로 구분된 형태)
-
-        Returns:
-            공식 회의록 문서
-
-        Raises:
-            ReportGeneratorError: 회의록 생성 실패 시
+        대화록을 바탕으로 공식 회의록 문서를 생성합니다. (기존 기능)
         """
         self.logger.info("공식 회의록 문서 생성 중...")
 
@@ -141,16 +125,7 @@ class ReportGenerator:
 
     def generate_action_items(self, transcript: str) -> str:
         """
-        대화록에서 액션 아이템을 추출합니다.
-
-        Args:
-            transcript: 대화록 텍스트
-
-        Returns:
-            액션 아이템 목록
-
-        Raises:
-            ReportGeneratorError: 액션 아이템 추출 실패 시
+        대화록에서 액션 아이템을 추출합니다. (기존 기능)
         """
         self.logger.info("액션 아이템 추출 중...")
 
@@ -174,16 +149,7 @@ class ReportGenerator:
 
     def analyze_sentiment(self, transcript: str) -> str:
         """
-        회의 분위기와 참석자들의 감정을 분석합니다.
-
-        Args:
-            transcript: 대화록 텍스트
-
-        Returns:
-            감정 분석 결과
-
-        Raises:
-            ReportGeneratorError: 감정 분석 실패 시
+        회의 분위기와 참석자들의 감정을 분석합니다. (기존 기능)
         """
         self.logger.info("회의 분위기 분석 중...")
 
@@ -203,16 +169,7 @@ class ReportGenerator:
 
     def generate_follow_up_questions(self, transcript: str) -> str:
         """
-        회의 내용을 바탕으로 후속 질문을 생성합니다.
-
-        Args:
-            transcript: 대화록 텍스트
-
-        Returns:
-            후속 질문 목록
-
-        Raises:
-            ReportGeneratorError: 질문 생성 실패 시
+        회의 내용을 바탕으로 후속 질문을 생성합니다. (기존 기능)
         """
         self.logger.info("후속 질문 생성 중...")
 
@@ -230,18 +187,11 @@ class ReportGenerator:
 """
         return self._call_llm(system_prompt, user_prompt)
 
+    # --- [신규 기능 6개 (Git + Local Merge)] ---
+
     def extract_keywords(self, transcript: str) -> str:
         """
-        대화록에서 핵심 키워드를 추출합니다.
-
-        Args:
-            transcript: 대화록 텍스트
-
-        Returns:
-            키워드 목록
-
-        Raises:
-            ReportGeneratorError: 키워드 추출 실패 시
+        대화록에서 핵심 키워드를 추출합니다. (Git 'e319...' 버전 기준)
         """
         self.logger.info("핵심 키워드 추출 중...")
 
@@ -276,16 +226,7 @@ class ReportGenerator:
 
     def classify_topics(self, transcript: str) -> str:
         """
-        대화록의 주제를 분류하고 카테고리화합니다.
-
-        Args:
-            transcript: 대화록 텍스트
-
-        Returns:
-            주제 분류 결과
-
-        Raises:
-            ReportGeneratorError: 주제 분류 실패 시
+        대화록의 주제를 분류하고 카테고리화합니다. (Git 'e319...' 버전 신규)
         """
         self.logger.info("주제 분류 중...")
 
@@ -322,16 +263,7 @@ class ReportGenerator:
 
     def analyze_by_speaker(self, transcript: str) -> str:
         """
-        발언자별로 내용을 요약하고 분석합니다.
-
-        Args:
-            transcript: 화자 정보가 포함된 대화록 텍스트
-
-        Returns:
-            발언자별 분석 결과
-
-        Raises:
-            ReportGeneratorError: 발언자별 분석 실패 시
+        발언자별로 내용을 요약하고 분석합니다. (Git 'e319...' 버전 신규)
         """
         self.logger.info("발언자별 분석 중...")
 
@@ -365,16 +297,7 @@ class ReportGenerator:
 
     def classify_meeting_type(self, transcript: str) -> str:
         """
-        회의 유형을 분류합니다.
-
-        Args:
-            transcript: 대화록 텍스트
-
-        Returns:
-            회의 유형 분류 결과
-
-        Raises:
-            ReportGeneratorError: 회의 유형 분류 실패 시
+        회의 유형을 분류합니다. (Git 'e319...' 버전 신규)
         """
         self.logger.info("회의 유형 분류 중...")
 
@@ -420,3 +343,30 @@ class ReportGenerator:
 회의 유형 분류:
 """
         return self._call_llm(system_prompt, user_prompt, temperature=0.1)
+
+    def summarize_by_speaker(self, transcript: str) -> str:
+        """
+        대화록을 바탕으로 화자별 주요 발언을 요약합니다. (로컬 DB 버전 신규)
+        (analyze_by_speaker보다 간단한 요약본)
+        """
+        self.logger.info("화자별 간단 요약 생성 중...")
+
+        system_prompt = """당신은 회의록을 바탕으로 각 화자의 주요 입장이나 발언을 요약하는 전문가입니다.
+        [화자 N] 형태로 구분된 대화록을 보고, 각 화자별로 핵심 주장을 1~2줄로 요약해주세요.
+        모든 화자를 포함할 필요는 없으며, 중요 발언을 한 화자 중심으로 정리해주세요.
+
+        [출력 형식]
+        - [화자 1]: (화자 1의 핵심 발언 요약)
+        - [화자 2]: (화자 2의 핵심 발언 요약)
+        """
+
+        user_prompt = f"""
+다음 회의록을 화자별로 요약해주세요.
+
+--- [회의록] ---
+{transcript}
+----------------
+
+화자별 요약:
+"""
+        return self._call_llm(system_prompt, user_prompt)
