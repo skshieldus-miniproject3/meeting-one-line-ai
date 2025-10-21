@@ -116,7 +116,7 @@ class ClovaSpeechClient:
         """
         # 기본 파라미터
         params = {
-            'language': options.get('language', 'ko-KR'),
+            'language': options.get('language', 'enko'),  # 한영 혼합 인식 기본값
             'completion': options.get('completion', 'sync'),
             'wordAlignment': options.get('wordAlignment', True),
             'fullText': options.get('fullText', True),

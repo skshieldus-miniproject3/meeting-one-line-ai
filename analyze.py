@@ -40,7 +40,7 @@ def load_config():
 
 def transcribe_if_audio(file_path: str) -> str:
     """오디오 파일인 경우 전사 후 대화록 반환"""
-    audio_extensions = {'.wav', '.mp3', '.m4a', '.flac', '.aac'}
+    audio_extensions = {'.wav', '.mp3', '.m4a', '.flac', '.aac', '.webm', '.ogg', '.opus'}
     file_ext = Path(file_path).suffix.lower()
 
     if file_ext not in audio_extensions:
@@ -48,8 +48,8 @@ def transcribe_if_audio(file_path: str) -> str:
         with open(file_path, 'r', encoding='utf-8') as f:
             return f.read()
 
-    print(f"� 오디오 파일 감지: {file_path}")
-    print("� 먼저 전사를 진행합니다...")
+    print(f"[오디오 파일 감지]: {file_path}")
+    print("[먼저 전사를 진행합니다...]")
 
     # CLOVA Speech 클라이언트 초기화
     try:
@@ -63,7 +63,7 @@ def transcribe_if_audio(file_path: str) -> str:
 
     # 전사 옵션 (회의에 최적화)
     options = {
-        'language': 'ko-KR',
+        'language': 'enko',  # 한영 혼합 인식
         'completion': 'sync',
         'wordAlignment': True,
         'fullText': True,
@@ -84,7 +84,7 @@ def transcribe_if_audio(file_path: str) -> str:
             print(" 전사 결과에 세그먼트가 없습니다")
             return None
 
-        print(f" 전사 완료: {len(segments)}개 세그먼트")
+        print(f"[전사 완료]: {len(segments)}개 세그먼트")
         return format_segments_to_transcript(segments)
 
     except ClovaSpeechError as e:
@@ -98,31 +98,47 @@ def analyze_transcript(transcript: str, analysis_types: list) -> dict:
         generator = ReportGenerator()
     except Exception as e:
         print(f" AI 분석기 초기화 실패: {e}")
-        print("� OPENAI_API_KEY를 확인해주세요.")
+        print("[참고] OPENAI_API_KEY를 확인해주세요.")
         return {}
 
     results = {}
 
     try:
         if 'summary' in analysis_types:
-            print("� 핵심 요약 생성 중...")
+            print(f"[핵심 요약 생성 중...")
             results['summary'] = generator.summarize(transcript)
 
         if 'meeting_notes' in analysis_types:
-            print("� 공식 회의록 생성 중...")
+            print(f"[공식 회의록 생성 중...")
             results['meeting_notes'] = generator.generate_meeting_notes(transcript)
 
         if 'action_items' in analysis_types:
-            print("� 액션 아이템 추출 중...")
+            print(f"[액션 아이템 추출 중...")
             results['action_items'] = generator.generate_action_items(transcript)
 
         if 'sentiment' in analysis_types:
-            print("� 회의 분위기 분석 중...")
+            print(f"[회의 분위기 분석 중...")
             results['sentiment'] = generator.analyze_sentiment(transcript)
 
         if 'follow_up' in analysis_types:
             print(" 후속 질문 생성 중...")
             results['follow_up'] = generator.generate_follow_up_questions(transcript)
+
+        if 'keywords' in analysis_types:
+            print("[키워드 추출 중...")
+            results['keywords'] = generator.extract_keywords(transcript)
+
+        if 'topics' in analysis_types:
+            print("[주제 분류 중...")
+            results['topics'] = generator.classify_topics(transcript)
+
+        if 'by_speaker' in analysis_types:
+            print("[발언자별 분석 중...")
+            results['by_speaker'] = generator.analyze_by_speaker(transcript)
+
+        if 'meeting_type' in analysis_types:
+            print("[회의 유형 분류 중...")
+            results['meeting_type'] = generator.classify_meeting_type(transcript)
 
     except ReportGeneratorError as e:
         print(f" AI 분석 실패: {e}")
@@ -150,22 +166,22 @@ def save_analysis_results(input_file: str, transcript: str, analysis_results: di
 
         # 각 분석 결과 작성
         if 'summary' in analysis_results:
-            f.write("## � 핵심 요약\n\n")
+            f.write("## 핵심 요약\n\n")
             f.write(analysis_results['summary'])
             f.write("\n\n")
 
         if 'meeting_notes' in analysis_results:
-            f.write("## � 공식 회의록\n\n")
+            f.write("## 공식 회의록\n\n")
             f.write(analysis_results['meeting_notes'])
             f.write("\n\n")
 
         if 'action_items' in analysis_results:
-            f.write("## � 액션 아이템\n\n")
+            f.write("## 액션 아이템\n\n")
             f.write(analysis_results['action_items'])
             f.write("\n\n")
 
         if 'sentiment' in analysis_results:
-            f.write("## � 회의 분위기 분석\n\n")
+            f.write("## 회의 분위기 분석\n\n")
             f.write(analysis_results['sentiment'])
             f.write("\n\n")
 
@@ -174,12 +190,32 @@ def save_analysis_results(input_file: str, transcript: str, analysis_results: di
             f.write(analysis_results['follow_up'])
             f.write("\n\n")
 
+        if 'keywords' in analysis_results:
+            f.write("## 핵심 키워드\n\n")
+            f.write(analysis_results['keywords'])
+            f.write("\n\n")
+
+        if 'topics' in analysis_results:
+            f.write("## 주제 분류\n\n")
+            f.write(analysis_results['topics'])
+            f.write("\n\n")
+
+        if 'by_speaker' in analysis_results:
+            f.write("## 발언자별 분석\n\n")
+            f.write(analysis_results['by_speaker'])
+            f.write("\n\n")
+
+        if 'meeting_type' in analysis_results:
+            f.write("## 회의 유형 분류\n\n")
+            f.write(analysis_results['meeting_type'])
+            f.write("\n\n")
+
         # 원본 대화록 첨부
         f.write("---\n\n")
-        f.write("## � 원본 대화록\n\n")
+        f.write("## 원본 대화록\n\n")
         f.write(transcript)
 
-    print(f"� 분석 보고서 저장: {report_file}")
+    print(f"[분석 보고서 저장: {report_file}")
 
     # 개별 분석 결과도 JSON으로 저장
     import json
@@ -189,7 +225,7 @@ def save_analysis_results(input_file: str, transcript: str, analysis_results: di
             'transcript': transcript,
             'analysis': analysis_results
         }, f, indent=2, ensure_ascii=False)
-    print(f"� 분석 데이터 저장: {json_file}")
+    print(f"[분석 데이터 저장: {json_file}")
 
 
 def main():
@@ -202,6 +238,10 @@ def main():
     parser.add_argument("--action-items", action="store_true", help="액션 아이템 추출")
     parser.add_argument("--sentiment", action="store_true", help="회의 분위기 분석")
     parser.add_argument("--follow-up", action="store_true", help="후속 질문 생성")
+    parser.add_argument("--keywords", action="store_true", help="핵심 키워드 추출")
+    parser.add_argument("--topics", action="store_true", help="주제 분류")
+    parser.add_argument("--by-speaker", action="store_true", help="발언자별 분석")
+    parser.add_argument("--meeting-type", action="store_true", help="회의 유형 분류")
     parser.add_argument("--full-analysis", action="store_true", help="전체 분석 (모든 유형)")
 
     args = parser.parse_args()
@@ -223,7 +263,8 @@ def main():
     # 분석 유형 결정
     analysis_types = []
     if args.full_analysis:
-        analysis_types = ['summary', 'meeting_notes', 'action_items', 'sentiment', 'follow_up']
+        analysis_types = ['summary', 'meeting_notes', 'action_items', 'sentiment', 'follow_up',
+                         'keywords', 'topics', 'by_speaker', 'meeting_type']
     else:
         if args.summary:
             analysis_types.append('summary')
@@ -235,12 +276,20 @@ def main():
             analysis_types.append('sentiment')
         if args.follow_up:
             analysis_types.append('follow_up')
+        if args.keywords:
+            analysis_types.append('keywords')
+        if args.topics:
+            analysis_types.append('topics')
+        if args.by_speaker:
+            analysis_types.append('by_speaker')
+        if args.meeting_type:
+            analysis_types.append('meeting_type')
 
     # 기본값: 요약과 액션 아이템
     if not analysis_types:
         analysis_types = ['summary', 'action_items']
 
-    print(f"� 분석 유형: {', '.join(analysis_types)}")
+    print(f"[분석 유형]: {', '.join(analysis_types)}")
     print()
 
     # 대화록 준비 (오디오인 경우 전사 먼저)
@@ -248,7 +297,7 @@ def main():
     if not transcript:
         return 1
 
-    print(f"� 대화록 길이: {len(transcript)}자")
+    print(f"[대화록 길이: {len(transcript)}자")
     print()
 
     # AI 분석 실행
@@ -261,7 +310,7 @@ def main():
 
     # 결과 미리보기
     print("\n" + "="*50)
-    print("� 분석 완료")
+    print(f"[분석 완료")
     print("="*50)
 
     for analysis_type, result in analysis_results.items():
