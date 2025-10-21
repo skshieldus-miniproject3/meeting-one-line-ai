@@ -410,6 +410,8 @@ async def summarize_transcript(request: SummaryRequest):
         elif summary_type == "by_speaker": result = report_generator.analyze_by_speaker(transcript)
         elif summary_type == "meeting_type": result = report_generator.classify_meeting_type(transcript)
         elif summary_type == "speaker_summary": result = report_generator.summarize_by_speaker(transcript)
+        elif summary_type == "engagement_score": result = report_generator.calculate_engagement_score(transcript)
+        elif summary_type == "improvement_suggestions": result = report_generator.generate_improvement_suggestions(transcript)
         else: raise HTTPException(status_code=400, detail="지원하지 않는 summary_type입니다")
 
         return JSONResponse(content={"summary_type": summary_type, "result": result})

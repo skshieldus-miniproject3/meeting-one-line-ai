@@ -370,3 +370,114 @@ class ReportGenerator:
 화자별 요약:
 """
         return self._call_llm(system_prompt, user_prompt)
+
+    def calculate_engagement_score(self, transcript: str) -> str:
+        """
+        회의 참여도를 점수화하고 분석합니다.
+
+        Args:
+            transcript: 대화록 텍스트 (화자별로 구분된 형태)
+
+        Returns:
+            참여도 점수 분석 결과 (JSON 형식 문자열)
+            - overall_score: 전체 참여도 점수 (0-100)
+            - speaker_scores: 화자별 점수
+            - engagement_distribution: 참여 균형도
+            - key_insights: 주요 발견사항
+
+        Raises:
+            ReportGeneratorError: 점수 계산 실패 시
+        """
+        self.logger.info("회의 참여도 점수 계산 중...")
+
+        system_prompt = """당신은 회의 참여도를 평가하는 전문 분석가입니다.
+        회의록을 분석하여 참여도를 정량적으로 평가하고 점수화하세요.
+
+        [평가 기준]
+        1. 발언 빈도와 시간 분포 (30점)
+        2. 발언의 질과 기여도 (40점)
+        3. 참여 균형도 (30점)
+
+        [출력 형식 - JSON]
+        {
+            "overall_score": 85,
+            "speaker_scores": {
+                "화자1": {"score": 90, "발언수": 15, "기여도": "높음"},
+                "화자2": {"score": 75, "발언수": 10, "기여도": "중간"}
+            },
+            "engagement_distribution": "균형적" 또는 "불균형",
+            "participation_balance": 80,
+            "key_insights": [
+                "화자1이 가장 활발하게 참여",
+                "화자3의 참여도 개선 필요"
+            ]
+        }
+        """
+
+        user_prompt = f"""
+다음 회의록을 분석하여 참여도를 점수화하고 JSON 형식으로 반환해주세요.
+
+--- [회의록] ---
+{transcript}
+----------------
+
+참여도 점수 분석:
+"""
+        return self._call_llm(system_prompt, user_prompt, temperature=0.2)
+
+    def generate_improvement_suggestions(self, transcript: str) -> str:
+        """
+        회의 개선을 위한 구체적인 제안을 생성합니다.
+
+        Args:
+            transcript: 대화록 텍스트 (화자별로 구분된 형태)
+
+        Returns:
+            회의 개선 제안 (구조화된 텍스트)
+            - 회의 진행 방식 개선
+            - 시간 관리 개선
+            - 참여도 향상 방안
+            - 실행 가능한 구체적 제안
+
+        Raises:
+            ReportGeneratorError: 제안 생성 실패 시
+        """
+        self.logger.info("회의 개선 제안 생성 중...")
+
+        system_prompt = """당신은 효과적인 회의 진행을 위한 컨설턴트입니다.
+        회의록을 분석하여 실행 가능한 구체적인 개선 제안을 제공하세요.
+
+        [분석 영역]
+        1. 회의 진행 방식 (의사결정, 주제 관리)
+        2. 시간 관리 (주제별 시간 배분)
+        3. 참여도 향상 (소극적 참여자 독려)
+        4. 커뮤니케이션 효율성
+
+        [출력 형식]
+        ## 🎯 종합 평가
+        (회의의 전반적인 평가)
+
+        ## 💡 주요 개선 제안
+        1. [구체적 제안 1]
+           - 현재 문제: (문제점 설명)
+           - 개선 방안: (실행 가능한 방법)
+           - 기대 효과: (개선 시 효과)
+
+        2. [구체적 제안 2]
+           ...
+
+        ## 📊 다음 회의 체크리스트
+        - [ ] (실행 항목 1)
+        - [ ] (실행 항목 2)
+        """
+
+        user_prompt = f"""
+다음 회의록을 분석하여 구체적이고 실행 가능한 개선 제안을 제공해주세요.
+
+--- [회의록] ---
+{transcript}
+----------------
+
+개선 제안:
+"""
+        return self._call_llm(system_prompt, user_prompt, temperature=0.4)

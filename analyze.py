@@ -140,6 +140,14 @@ def analyze_transcript(transcript: str, analysis_types: list) -> dict:
             print("[회의 유형 분류 중...")
             results['meeting_type'] = generator.classify_meeting_type(transcript)
 
+        if 'engagement_score' in analysis_types:
+            print("[참여도 점수 계산 중...")
+            results['engagement_score'] = generator.calculate_engagement_score(transcript)
+
+        if 'improvement_suggestions' in analysis_types:
+            print("[개선 제안 생성 중...")
+            results['improvement_suggestions'] = generator.generate_improvement_suggestions(transcript)
+
     except ReportGeneratorError as e:
         print(f" AI 분석 실패: {e}")
         return {}
@@ -210,6 +218,16 @@ def save_analysis_results(input_file: str, transcript: str, analysis_results: di
             f.write(analysis_results['meeting_type'])
             f.write("\n\n")
 
+        if 'engagement_score' in analysis_results:
+            f.write("## 📊 참여도 점수\n\n")
+            f.write(analysis_results['engagement_score'])
+            f.write("\n\n")
+
+        if 'improvement_suggestions' in analysis_results:
+            f.write("## 💡 회의 개선 제안\n\n")
+            f.write(analysis_results['improvement_suggestions'])
+            f.write("\n\n")
+
         # 원본 대화록 첨부
         f.write("---\n\n")
         f.write("## 원본 대화록\n\n")
@@ -242,6 +260,8 @@ def main():
     parser.add_argument("--topics", action="store_true", help="주제 분류")
     parser.add_argument("--by-speaker", action="store_true", help="발언자별 분석")
     parser.add_argument("--meeting-type", action="store_true", help="회의 유형 분류")
+    parser.add_argument("--engagement-score", action="store_true", help="참여도 점수화")
+    parser.add_argument("--improvement-suggestions", action="store_true", help="회의 개선 제안")
     parser.add_argument("--full-analysis", action="store_true", help="전체 분석 (모든 유형)")
 
     args = parser.parse_args()
@@ -264,7 +284,8 @@ def main():
     analysis_types = []
     if args.full_analysis:
         analysis_types = ['summary', 'meeting_notes', 'action_items', 'sentiment', 'follow_up',
-                         'keywords', 'topics', 'by_speaker', 'meeting_type']
+                         'keywords', 'topics', 'by_speaker', 'meeting_type',
+                         'engagement_score', 'improvement_suggestions']
     else:
         if args.summary:
             analysis_types.append('summary')
@@ -284,6 +305,10 @@ def main():
             analysis_types.append('by_speaker')
         if args.meeting_type:
             analysis_types.append('meeting_type')
+        if args.engagement_score:
+            analysis_types.append('engagement_score')
+        if args.improvement_suggestions:
+            analysis_types.append('improvement_suggestions')
 
     # 기본값: 요약과 액션 아이템
     if not analysis_types:
