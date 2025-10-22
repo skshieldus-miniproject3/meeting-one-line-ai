@@ -167,8 +167,7 @@ async def root():
             "/transcript/summarize",
             "/transcript/statistics",
             "/upload_and_analyze",
-            "/search/semantic",
-            "/embeddings/stats",
+            "/search/semantic",  # 의미 기반 검색
             "/ai/analyze" # [신규] App 서버 연동 엔드포인트
         ]
     }
@@ -232,7 +231,7 @@ async def background_analysis_task(meeting_id: str, file_path: str):
     """
     print(f"[Task {meeting_id}] AI 분석 작업 시작: {file_path}")
     
-    # App 서버로 전송할 콜백 데이터 (요청 사양에 맞춘 형식)
+    # App 서버로 전송할 콜백 데이터
     callback_data = {
         "status": "failed", # 기본값 'failed'
         "summary": None,
@@ -730,70 +729,6 @@ async def semantic_search(request: SemanticSearchRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검색 실패: {str(e)}")
-
-
-@app.get("/embeddings/stats")
-async def get_embedding_stats():
-    """
-    저장된 임베딩 통계 정보 조회
-    """
-    try:
-        stats = embedding_manager.get_stats()
-        return stats
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"통계 조회 실패: {str(e)}")
-
-
-@app.post("/embeddings/save")
-async def save_meeting_embedding(
-    meeting_id: str = Form(...),
-    title: str = Form(...),
-    summary: str = Form(...)
-):
-    """
-    회의록 임베딩 생성 및 저장
-    """
-    if not report_generator:
-        raise HTTPException(status_code=500, detail="OpenAI API 키가 설정되지 않았습니다")
-
-    try:
-        # 1. 요약 텍스트를 임베딩으로 변환
-        embedding = report_generator.generate_embedding(summary)
-
-        # 2. 임베딩 저장
-        embedding_manager.save_meeting_embedding(
-            meeting_id=meeting_id,
-            title=title,
-            summary=summary,
-            embedding=embedding
-        )
-
-        return {
-            "message": "임베딩 저장 완료",
-            "meeting_id": meeting_id
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"임베딩 저장 실패: {str(e)}")
-
-
-@app.delete("/embeddings/{meeting_id}")
-async def delete_meeting_embedding(meeting_id: str):
-    """
-    회의록 임베딩 삭제
-    """
-    try:
-        success = embedding_manager.delete_meeting_embedding(meeting_id)
-
-        if success:
-            return {"message": f"임베딩 삭제 완료: {meeting_id}"}
-        else:
-            raise HTTPException(status_code=404, detail=f"임베딩을 찾을 수 없습니다: {meeting_id}")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"임베딩 삭제 실패: {str(e)}")
 
 
 # ========================================
