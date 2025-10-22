@@ -51,11 +51,16 @@ Thumbs.db
 *.m4a
 *.flac
 *.aac
+*.webm
+audio/
 
 # Output files
 outputs/
 temp/
 *.tmp
+
+# Test data
+test_meeting.txt
 
 # Embeddings storage
 embeddings/
