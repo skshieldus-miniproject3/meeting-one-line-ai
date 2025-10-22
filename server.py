@@ -1,11 +1,13 @@
 """CLOVA Speech REST API 서버 (DB 연동 제거 버전)
 [수정됨] App 서버 연동을 위한 /ai/analyze 엔드포인트 및 콜백 로직 추가
+[수정됨] /meetings 회의록 목록 조회 엔드포인트 추가
 """
 
 import os
 import uuid
 import asyncio
 import requests  # [신규] 콜백 전송을 위해 추가
+import math      # [신규] 페이징 계산을 위해 추가
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
@@ -50,7 +52,7 @@ load_dotenv()
 app = FastAPI(
     title="CLOVA Speech STT API",
     description="NAVER Cloud Platform CLOVA Speech API 서버 (DB 연동 제거)",
-    version="1.5.0" # 버전 업데이트 (App 서버 연동)
+    version="1.6.0" # [수정] 버전 업데이트 (회의록 목록)
 )
 
 # 글로벌 설정
@@ -138,7 +140,7 @@ class JobResponse(BaseModel):
     message: Optional[str] = None
 
 # ========================================
-# [신규] App 서버 연동을 위한 Pydantic 모델
+# App 서버 연동을 위한 Pydantic 모델
 # ========================================
 
 class AiAnalyzeRequest(BaseModel):
@@ -151,13 +153,32 @@ class AiAnalyzeResponse(BaseModel):
     status: str
 
 # ========================================
+# [신규] 3.4 회의록 목록 조회를 위한 Pydantic 모델
+# ========================================
+
+class MeetingListItem(BaseModel):
+    """회의록 목록의 개별 항목 모델"""
+    meetingId: str
+    title: str
+    status: str
+    summary: Optional[str] = None
+    createdAt: str
+
+class MeetingListResponse(BaseModel):
+    """회의록 목록 페이징 응답 모델"""
+    content: List[MeetingListItem]
+    page: int
+    size: int
+    totalPages: int
+
+# ========================================
 
 @app.get("/")
 async def root():
     """루트 엔드포인트"""
     return {
         "service": "CLOVA Speech STT API",
-        "version": "1.5.0", # 버전 업데이트
+        "version": "1.6.0", # [수정] 버전 업데이트
         "endpoints": [
             "/stt/url",
             "/stt/file",
@@ -168,7 +189,8 @@ async def root():
             "/transcript/statistics",
             "/upload_and_analyze",
             "/search/semantic",  # 의미 기반 검색
-            "/ai/analyze" # [신규] App 서버 연동 엔드포인트
+            "/ai/analyze", # App 서버 연동 엔드포인트
+            "/meetings"   # [신규] 회의록 목록 조회
         ]
     }
 
@@ -180,7 +202,7 @@ async def health():
 
 
 # ========================================
-# [신규] App 서버 연동을 위한 헬퍼 함수 및 백그라운드 작업
+# App 서버 연동을 위한 헬퍼 함수 및 백그라운드 작업
 # ========================================
 
 def format_clova_to_app_speakers(segments: list) -> list:
@@ -226,7 +248,7 @@ def format_clova_to_app_speakers(segments: list) -> list:
 
 async def background_analysis_task(meeting_id: str, file_path: str):
     """
-    [신규] 백그라운드에서 STT, 화자 분리, 요약, 키워드 추출을 수행하고
+    백그라운드에서 STT, 화자 분리, 요약, 키워드 추출을 수행하고
     App 서버로 새로운 형식의 콜백을 전송하는 함수
     """
     print(f"[Task {meeting_id}] AI 분석 작업 시작: {file_path}")
@@ -732,7 +754,7 @@ async def semantic_search(request: SemanticSearchRequest):
 
 
 # ========================================
-# [신규] App 서버 연동 엔드포인트
+# App 서버 연동 엔드포인트
 # ========================================
 
 @app.post("/ai/analyze", 
@@ -743,7 +765,7 @@ async def request_ai_analysis(
     background_tasks: BackgroundTasks
 ):
     """
-    [신규] App 서버로부터 AI 분석(STT + 화자분리 + 요약)을 요청받습니다.
+    App 서버로부터 AI 분석(STT + 화자분리 + 요약)을 요청받습니다.
     
     즉시 'processing' 상태를 응답하고, 백그라운드에서 실제 작업을 수행합니다.
     작업 완료 시 App 서버의 '/api/meetings/{id}/callback'으로 결과를 POST합니다.
@@ -764,6 +786,121 @@ async def request_ai_analysis(
     
     # 요청 사양대로 즉시 응답 반환
     return AiAnalyzeResponse(status="processing")
+
+
+# ========================================
+# [신규] 3.4 회의록 목록 검색 조회
+# ========================================
+
+@app.get("/meetings", response_model=MeetingListResponse)
+async def get_meeting_list(
+    page: int = 1,
+    size: int = 10,
+    keyword: Optional[str] = None,
+    title: Optional[str] = None,
+    summary: Optional[str] = None,
+    status: Optional[str] = None
+):
+    """
+    [신규] 저장된 회의록 목록을 페이지 단위로 조회합니다.
+    
+    데이터는 `embeddings/` 디렉토리에 저장된 JSON 파일들을 기반으로 합니다.
+    
+    - `keyword`: 제목과 요약에서 동시 검색
+    - `title`: 제목에서 검색
+    - `summary`: 요약에서 검색
+    - `status`: 상태에서 검색 (현재 "completed"만 조회 가능)
+    """
+    try:
+        # 1. 모든 임베딩 데이터(회의록 정보) 로드
+        # 'embedding_manager'는 server.py의 전역 인스턴스
+        all_meetings_data = embedding_manager.load_all_embeddings()
+        
+        enriched_meetings = []
+        for meeting_data in all_meetings_data:
+            meeting_id = meeting_data.get("meeting_id")
+            if not meeting_id:
+                continue
+            
+            # 2. 'createdAt' (파일 수정시간), 'status' 필드 동적 추가
+            file_path = embedding_manager.embeddings_dir / f"meeting_{meeting_id}.json"
+            created_at_iso = datetime.now().isoformat() # 기본값
+            
+            if file_path.exists():
+                try:
+                    # 파일의 마지막 수정 시간을 'createdAt'으로 사용
+                    mtime = file_path.stat().st_mtime
+                    created_at_iso = datetime.fromtimestamp(mtime).isoformat()
+                except Exception as e:
+                    print(f"파일 시간 읽기 오류: {meeting_id} - {e}")
+            
+            enriched_meetings.append({
+                "meetingId": meeting_id,
+                "title": meeting_data.get("title", ""),
+                "summary": meeting_data.get("summary", ""),
+                "status": "completed", # 임베딩이 저장된 것은 'completed'로 간주
+                "createdAt": created_at_iso
+            })
+        
+        # 3. 필터링 로직
+        filtered_meetings = enriched_meetings
+
+        # 3a. 'keyword' (제목 + 요약 동시 검색)
+        if keyword:
+            kw = keyword.lower()
+            filtered_meetings = [
+                m for m in filtered_meetings 
+                if kw in m['title'].lower() or kw in m['summary'].lower()
+            ]
+        
+        # 3b. 'title' (제목 검색)
+        if title:
+            filtered_meetings = [
+                m for m in filtered_meetings 
+                if title.lower() in m['title'].lower()
+            ]
+        
+        # 3c. 'summary' (요약 검색)
+        if summary:
+            filtered_meetings = [
+                m for m in filtered_meetings 
+                if summary.lower() in m['summary'].lower()
+            ]
+        
+        # 3d. 'status' (상태 검색)
+        if status:
+            filtered_meetings = [
+                m for m in filtered_meetings 
+                if status.lower() == m['status'].lower()
+            ]
+
+        # 4. 정렬 (최신순)
+        filtered_meetings.sort(key=lambda m: m['createdAt'], reverse=True)
+
+        # 5. 페이징
+        total_items = len(filtered_meetings)
+        total_pages = math.ceil(total_items / size)
+        
+        # 페이지 번호 보정
+        if page < 1:
+            page = 1
+        
+        start_index = (page - 1) * size
+        end_index = start_index + size
+        
+        paginated_content = filtered_meetings[start_index:end_index]
+
+        # 6. 응답 모델로 반환
+        return MeetingListResponse(
+            content=paginated_content,
+            page=page,
+            size=size,
+            totalPages=total_pages
+        )
+
+    except Exception as e:
+        print(f"❌ /meetings 엔드포인트 오류: {e}")
+        raise HTTPException(status_code=500, detail=f"회의록 목록 조회 중 오류 발생: {e}")
 
 
 # ========================================
