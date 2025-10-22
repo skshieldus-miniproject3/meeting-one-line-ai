@@ -288,10 +288,22 @@ async def background_analysis_task(meeting_id: str, file_path: str):
             
             # AI가 반환한 텍스트("- 키워드1\n- 키워드2")를 파싱하여 리스트로 변환
             raw_keywords = [line.strip().lstrip('-•* ').strip() for line in keyword_text.split('\n') if line.strip().lstrip('-•* ').strip()]
-            
-            # "주요 주제어:", "고유명사:" 같은 카테고리명 제거
-            cleaned_keywords = [kw for kw in raw_keywords if not kw.endswith(':')]
-            callback_data["keywords"] = cleaned_keywords
+
+            # 키워드 정제
+            # 1. 카테고리명 제거 (끝에 ':' 있는 것)
+            # 2. 긴 문장 제거 (30자 이상 또는 마침표/쉼표 2개 이상 포함)
+            # 3. 중복 제거 (순서 유지)
+            # 4. 상위 10개만 선택
+            filtered_keywords = [
+                kw for kw in raw_keywords
+                if not kw.endswith(':')
+                and len(kw) <= 30
+                and (kw.count('.') + kw.count(',')) < 2  # 설명문 제거
+            ]
+            # 중복 제거 (순서 유지)
+            unique_keywords = list(dict.fromkeys(filtered_keywords))
+            # 상위 10개만
+            callback_data["keywords"] = unique_keywords[:10]
 
         else:
             print(f"[Task {meeting_id}] 3. AI 요약기(OpenAI)가 없거나 대화록이 비어 요약을 건너뜁니다.")
