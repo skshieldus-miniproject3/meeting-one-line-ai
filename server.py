@@ -216,7 +216,11 @@ def format_clova_to_app_speakers(segments: list) -> list:
         except Exception as e:
             # 세그먼트 하나가 실패해도 전체가 중단되지 않도록 로깅만
             print(f"세그먼트 포맷팅 중 오류: {e} (세그먼트: {segment})")
-            
+
+    # 각 화자의 segments를 시간순으로 정렬
+    for speaker_data in speakers_dict.values():
+        speaker_data["segments"].sort(key=lambda x: x["start"])
+
     # 딕셔너리의 값들(value)을 리스트로 변환하여 반환
     return list(speakers_dict.values())
 
