@@ -1,15 +1,18 @@
-"""CLOVA Speech REST API 서버 (DB 연동 제거 버전)"""
+"""CLOVA Speech REST API 서버 (DB 연동 제거 버전)
+[수정됨] App 서버 연동을 위한 /ai/analyze 엔드포인트 및 콜백 로직 추가
+"""
 
 import os
 import uuid
 import asyncio
+import requests  # [신규] 콜백 전송을 위해 추가
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException, BackgroundTasks,
-    Depends, Form  # Depends는 DB 제거로 실제 사용 안 함
+    Depends, Form
 )
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
@@ -47,22 +50,22 @@ load_dotenv()
 app = FastAPI(
     title="CLOVA Speech STT API",
     description="NAVER Cloud Platform CLOVA Speech API 서버 (DB 연동 제거)",
-    version="1.3.0" # 버전 업데이트
+    version="1.5.0" # 버전 업데이트 (App 서버 연동)
 )
 
 # 글로벌 설정
 INVOKE_URL = os.getenv('CLOVA_SPEECH_INVOKE_URL')
 SECRET_KEY = os.getenv('CLOVA_SPEECH_SECRET_KEY')
+# [신규] App 서버 콜백 호스트
+APP_SERVER_CALLBACK_HOST = os.getenv('APP_SERVER_CALLBACK_HOST')
 
 if not INVOKE_URL or not SECRET_KEY:
     raise ValueError("CLOVA_SPEECH_INVOKE_URL과 CLOVA_SPEECH_SECRET_KEY를 .env에 설정해주세요")
 
 # 클라이언트 인스턴스
-# [참고] stt_client.py는 'enko' 기본값을 사용 (kwak 버전 기준)
 client = ClovaSpeechClient(INVOKE_URL, SECRET_KEY)
 
 # AI 보고서 생성기 (OpenAI 키가 있는 경우에만)
-# [참고] ai_analyzer.py는 병합된 10개 AI 기능 포함 (kwak 버전 기준)
 try:
     report_generator = ReportGenerator()
 except Exception:
@@ -83,7 +86,7 @@ job_store: Dict[str, Dict[str, Any]] = {}
 class URLRequest(BaseModel):
     """URL 방식 요청 모델"""
     url: HttpUrl
-    language: str = "enko" # kwak 버전 기본값
+    language: str = "enko"
     completion: str = "sync"
     word_alignment: bool = True
     full_text: bool = True
@@ -99,7 +102,7 @@ class URLRequest(BaseModel):
 class MeetingRequest(BaseModel):
     """회의 전사 요청 모델"""
     url: HttpUrl
-    language: str = "enko" # kwak 버전 기본값
+    language: str = "enko"
     include_ai_summary: bool = True
     meeting_title: Optional[str] = None
     speaker_count_min: int = 2
@@ -118,7 +121,7 @@ class TranscriptFormatRequest(BaseModel):
 class SummaryRequest(BaseModel):
     """요약 요청 모델"""
     transcript: str
-    summary_type: str = "summary" # 병합된 모든 AI 타입 포함
+    summary_type: str = "summary"
 
 
 class SemanticSearchRequest(BaseModel):
@@ -134,13 +137,27 @@ class JobResponse(BaseModel):
     created_at: str
     message: Optional[str] = None
 
+# ========================================
+# [신규] App 서버 연동을 위한 Pydantic 모델
+# ========================================
+
+class AiAnalyzeRequest(BaseModel):
+    """AI 분석 요청 모델 (App Server -> AI Server)"""
+    meetingId: str
+    filePath: str # 예: /data/uploads/meeting_123.wav
+
+class AiAnalyzeResponse(BaseModel):
+    """AI 분석 요청 즉시 응답 모델"""
+    status: str
+
+# ========================================
 
 @app.get("/")
 async def root():
     """루트 엔드포인트"""
     return {
         "service": "CLOVA Speech STT API",
-        "version": "1.4.0", # 버전 업데이트 (임베딩 검색 추가)
+        "version": "1.5.0", # 버전 업데이트
         "endpoints": [
             "/stt/url",
             "/stt/file",
@@ -149,10 +166,10 @@ async def root():
             "/transcript/format",
             "/transcript/summarize",
             "/transcript/statistics",
-            "/upload_and_analyze", # [수정] DB 저장 기능 없음
-            "/search/semantic",  # 임베딩 의미 검색
-            "/embeddings/stats",  # 임베딩 통계
-            # "/history" # [삭제] DB 조회 엔드포인트 제거
+            "/upload_and_analyze",
+            "/search/semantic",
+            "/embeddings/stats",
+            "/ai/analyze" # [신규] App 서버 연동 엔드포인트
         ]
     }
 
@@ -163,8 +180,151 @@ async def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 
-# --- [기존 엔드포인트들 (stt/url, stt/file 등)은 DB와 무관하므로 변경 없음] ---
-# ... (stt/url, stt/file, stt/status/{job_id} 코드 생략 - 이전 버전과 동일) ...
+# ========================================
+# [신규] App 서버 연동을 위한 헬퍼 함수 및 백그라운드 작업
+# ========================================
+
+def format_clova_to_app_speakers(segments: list) -> list:
+    """
+    CLOVA STT segments를 App 서버 콜백('speakers') 형식으로 변환합니다.
+    - 화자별로 그룹화
+    - 타임스탬프를 밀리초(ms)에서 초(sec)로 변환
+    """
+    speakers_dict = {}
+    
+    if not segments:
+        return []
+        
+    for segment in segments:
+        try:
+            # "S1", "S2" ... 형식으로 speakerId 생성
+            speaker_label = segment.get("speaker", {}).get("label", "Unknown")
+            speaker_id = f"S{speaker_label}" 
+            
+            if speaker_id not in speakers_dict:
+                speakers_dict[speaker_id] = {"speakerId": speaker_id, "segments": []}
+            
+            # 밀리초 -> 초 변환 (소수점)
+            start_sec = segment.get("start", 0) / 1000.0
+            end_sec = segment.get("end", 0) / 1000.0
+            
+            speakers_dict[speaker_id]["segments"].append({
+                "start": round(start_sec, 2), # 소수점 2자리
+                "end": round(end_sec, 2),   # 소수점 2자리
+                "text": segment.get("text", "").strip()
+            })
+        except Exception as e:
+            # 세그먼트 하나가 실패해도 전체가 중단되지 않도록 로깅만
+            print(f"세그먼트 포맷팅 중 오류: {e} (세그먼트: {segment})")
+            
+    # 딕셔너리의 값들(value)을 리스트로 변환하여 반환
+    return list(speakers_dict.values())
+
+
+async def background_analysis_task(meeting_id: str, file_path: str):
+    """
+    [신규] 백그라운드에서 STT, 화자 분리, 요약, 키워드 추출을 수행하고
+    App 서버로 새로운 형식의 콜백을 전송하는 함수
+    """
+    print(f"[Task {meeting_id}] AI 분석 작업 시작: {file_path}")
+    
+    # App 서버로 전송할 콜백 데이터 (요청 사양에 맞춘 형식)
+    callback_data = {
+        "status": "failed", # 기본값 'failed'
+        "summary": None,
+        "keywords": [],
+        "speakers": [],
+        "error": None
+    }
+    
+    try:
+        # 0. 파일 경로 유효성 검사 (AI 서버 로컬 경로)
+        local_path = Path(file_path)
+        if not local_path.exists():
+            raise FileNotFoundError(f"AI 서버에서 해당 파일을 찾을 수 없습니다: {file_path}")
+
+        # 1. STT + 화자 분리 (CLOVA Speech 사용)
+        print(f"[Task {meeting_id}] 1. STT(Clova) 및 화자 분리 시작...")
+        stt_options = {
+            'language': 'enko',  # 한영 혼합
+            'completion': 'sync', # 동기 처리 (결과를 바로 받아야 함)
+            'wordAlignment': True,
+            'fullText': True,
+            'enable_diarization': True, # 화자 분리 활성화
+            'diarization': {
+                'enable': True,
+                'speakerCountMin': 2,
+                'speakerCountMax': 10
+            }
+        }
+        
+        # 'client'는 server.py의 전역 ClovaSpeechClient 인스턴스
+        stt_result = client.request_by_file(local_path, **stt_options)
+        
+        if 'segments' not in stt_result or not stt_result['segments']:
+            raise ValueError("STT 실패: Clova 결과에 'segments'가 없습니다.")
+        
+        segments = stt_result.get('segments', [])
+        print(f"[Task {meeting_id}] 2. STT 완료 (세그먼트 {len(segments)}개)")
+        
+        # 2. 대화록(flat text) 변환 (AI 분석용)
+        transcript = format_segments_to_transcript(segments)
+        
+        # 3. AI 분석 (요약 + 키워드)
+        # 'report_generator'는 server.py의 전역 ReportGenerator 인스턴스
+        if report_generator and transcript:
+            print(f"[Task {meeting_id}] 3. AI 요약(OpenAI) 시작...")
+            # 3a. 요약
+            callback_data["summary"] = report_generator.summarize(transcript)
+            
+            print(f"[Task {meeting_id}] 4. AI 키워드 추출(OpenAI) 시작...")
+            # 3b. 키워드
+            # extract_keywords는 텍스트를 반환
+            keyword_text = report_generator.extract_keywords(transcript) 
+            
+            # AI가 반환한 텍스트("- 키워드1\n- 키워드2")를 파싱하여 리스트로 변환
+            raw_keywords = [line.strip().lstrip('-•* ').strip() for line in keyword_text.split('\n') if line.strip().lstrip('-•* ').strip()]
+            
+            # "주요 주제어:", "고유명사:" 같은 카테고리명 제거
+            cleaned_keywords = [kw for kw in raw_keywords if not kw.endswith(':')]
+            callback_data["keywords"] = cleaned_keywords
+
+        else:
+            print(f"[Task {meeting_id}] 3. AI 요약기(OpenAI)가 없거나 대화록이 비어 요약을 건너뜁니다.")
+
+        # 4. 화자 데이터 포맷팅 (App 서버 요구사항)
+        print(f"[Task {meeting_id}] 5. 화자 데이터 포맷팅...")
+        callback_data["speakers"] = format_clova_to_app_speakers(segments)
+        
+        callback_data["status"] = "completed"
+        # 성공 시 error 필드는 None이므로 제거 (json에서 제외)
+        callback_data.pop("error") 
+
+    except Exception as e:
+        print(f"[Task {meeting_id}] ❌ 분석 중 오류 발생: {e}")
+        callback_data["error"] = str(e)
+        callback_data["status"] = "failed" # 명시적으로 failed 설정
+    
+    # 5. App 서버로 콜백 전송
+    if not APP_SERVER_CALLBACK_HOST:
+        print(f"[Task {meeting_id}] ⚠️ .env에 APP_SERVER_CALLBACK_HOST가 설정되지 않아 콜백을 보낼 수 없습니다.")
+        return
+        
+    # 요청 사양에 명시된 콜백 URL
+    callback_url = f"{APP_SERVER_CALLBACK_HOST}/api/meetings/{meeting_id}/callback"
+    
+    try:
+        # status가 'failed'일 때도 에러 정보를 콜백으로 전송
+        print(f"[Task {meeting_id}] 6. App 서버로 콜백 전송: {callback_url}")
+        response = requests.post(callback_url, json=callback_data, timeout=15)
+        response.raise_for_status() # 4xx, 5xx 에러 발생 시 예외
+        print(f"[Task {meeting_id}] 7. 콜백 전송 성공 (App 서버 응답: {response.status_code})")
+    except requests.exceptions.RequestException as e:
+        print(f"[Task {meeting_id}] ❌ 콜백 전송 실패: {e} (App 서버가 응답하지 않거나 에러 발생)")
+
+# ========================================
+# (기존 엔드포인트 - 변경 없음)
+# ========================================
 
 @app.post("/stt/url")
 async def transcribe_url(request: URLRequest, background_tasks: BackgroundTasks):
@@ -218,7 +378,7 @@ async def transcribe_url(request: URLRequest, background_tasks: BackgroundTasks)
 async def transcribe_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    language: str = Form("enko"), # kwak 버전 기본값
+    language: str = Form("enko"),
     completion: str = Form("sync"),
     word_alignment: bool = Form(True),
     full_text: bool = Form(True),
@@ -231,7 +391,7 @@ async def transcribe_file(
     speaker_count_max: int = Form(10)
 ):
     """파일 업로드 방식 음성 인식 (kwak 버전 기본값 enko 적용)"""
-    temp_file = None # finally 블록에서 사용하기 위해 초기화
+    temp_file = None
     try:
         temp_dir = Path("temp")
         temp_dir.mkdir(exist_ok=True)
@@ -264,7 +424,6 @@ async def transcribe_file(
                 'options': options, 'result': None
             }
             background_tasks.add_task(poll_result, job_id)
-            # temp_file은 poll_result에서 삭제하므로 여기서는 삭제 안 함
             return JobResponse(job_id=job_id, status='processing', created_at=job_store[job_id]['created_at'])
 
     except ClovaSpeechError as e:
@@ -272,7 +431,6 @@ async def transcribe_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"내부 서버 오류: {e}")
     finally:
-        # 비동기 모드가 아니고 임시 파일이 생성된 경우 여기서 삭제
         if completion == 'sync' and temp_file and temp_file.exists():
              temp_file.unlink(missing_ok=True)
 
@@ -301,7 +459,6 @@ async def poll_result(job_id: str):
         job_store[job_id]['status'] = 'failed'
         job_store[job_id]['error'] = str(e)
     finally:
-        # 비동기 작업 완료 후 임시 파일 정리
         if job_store[job_id]['type'] == 'file':
             temp_file_path = job_store[job_id].get('temp_file')
             if temp_file_path and Path(temp_file_path).exists():
@@ -311,11 +468,12 @@ async def poll_result(job_id: str):
 @app.on_event("startup")
 async def startup():
     """서버 시작 시 실행 (DB 초기화 제거)"""
-    # --- [DB 연동 제거] ---
-    # database.init_db() 제거
-    # -----------------------
     print("CLOVA Speech STT API server started")
     print(f"Invoke URL: {INVOKE_URL}")
+    if APP_SERVER_CALLBACK_HOST:
+        print(f"[CALLBACK] App Server Host: {APP_SERVER_CALLBACK_HOST}")
+    else:
+        print("[CALLBACK] ⚠️ APP_SERVER_CALLBACK_HOST가 .env에 설정되지 않았습니다. /ai/analyze 콜백이 작동하지 않습니다.")
 
 
 @app.on_event("shutdown")
@@ -445,13 +603,10 @@ async def get_transcript_statistics(segments: list):
         raise HTTPException(status_code=500, detail=f"통계 추출 오류: {e}")
 
 
-# --- [수정된 통합 엔드포인트 (DB 저장 제거)] ---
-
 @app.post("/upload_and_analyze")
 async def upload_and_analyze(
-    # [DB 연동 제거] db: Session = Depends(get_db), 제거
     file: UploadFile = File(...),
-    language: str = Form("enko"), # kwak 버전 기본값
+    language: str = Form("enko"),
     speaker_count_min: int = Form(2),
     speaker_count_max: int = Form(10)
 ):
@@ -461,7 +616,7 @@ async def upload_and_analyze(
     if not report_generator:
         raise HTTPException(status_code=503, detail="AI 요약 기능을 사용할 수 없습니다. OPENAI_API_KEY를 설정해주세요.")
 
-    temp_file = None # finally 블록에서 사용
+    temp_file = None
     try:
         # 1. 파일 임시 저장
         temp_dir = Path("temp")
@@ -516,16 +671,9 @@ async def upload_and_analyze(
     except Exception as e:
         ai_reports_error = f"AI 요약 생성 실패: {str(e)}"
 
-    # --- [DB 연동 제거] ---
-    # 4. DB 저장 로직 제거
-    # try: ... db.add()... 제거
-    # -----------------------
-
     # 5. 통합 결과 반환 (DB ID, 생성 시간 제거)
     response_data = {
-        # "db_id": None, # 제거
         "filename": file.filename,
-        # "created_at": None, # 제거
         "transcript": transcript,
         "speaker_statistics": speaker_stats,
         "ai_reports": ai_reports,
@@ -535,26 +683,15 @@ async def upload_and_analyze(
 
     return JSONResponse(content=response_data)
 
-# --- [DB 연동 제거] ---
-# @app.get("/history", ...) 엔드포인트 제거
-# -----------------------
-
 
 # ========================================
-# 임베딩 검색 API
+# 임베딩 검색 API (기존)
 # ========================================
 
 @app.post("/search/semantic")
 async def semantic_search(request: SemanticSearchRequest):
     """
     의미 기반 회의록 검색
-
-    요청:
-        - query: 검색 쿼리 (예: "예산 관련 회의")
-        - top_k: 반환할 결과 개수 (기본: 5)
-
-    응답:
-        - results: 유사도 높은 순으로 정렬된 회의록 목록
     """
     if not report_generator:
         raise HTTPException(status_code=500, detail="OpenAI API 키가 설정되지 않았습니다")
@@ -583,11 +720,6 @@ async def semantic_search(request: SemanticSearchRequest):
 async def get_embedding_stats():
     """
     저장된 임베딩 통계 정보 조회
-
-    응답:
-        - total_meetings: 총 회의록 개수
-        - storage_path: 저장 경로
-        - meetings: 회의록 목록
     """
     try:
         stats = embedding_manager.get_stats()
@@ -604,15 +736,6 @@ async def save_meeting_embedding(
 ):
     """
     회의록 임베딩 생성 및 저장
-
-    요청:
-        - meeting_id: 회의 ID
-        - title: 회의 제목
-        - summary: 회의 요약
-
-    응답:
-        - message: 성공 메시지
-        - meeting_id: 저장된 회의 ID
     """
     if not report_generator:
         raise HTTPException(status_code=500, detail="OpenAI API 키가 설정되지 않았습니다")
@@ -642,12 +765,6 @@ async def save_meeting_embedding(
 async def delete_meeting_embedding(meeting_id: str):
     """
     회의록 임베딩 삭제
-
-    경로 파라미터:
-        - meeting_id: 삭제할 회의 ID
-
-    응답:
-        - message: 성공/실패 메시지
     """
     try:
         success = embedding_manager.delete_meeting_embedding(meeting_id)
@@ -662,6 +779,43 @@ async def delete_meeting_embedding(meeting_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"임베딩 삭제 실패: {str(e)}")
 
+
+# ========================================
+# [신규] App 서버 연동 엔드포인트
+# ========================================
+
+@app.post("/ai/analyze", 
+          response_model=AiAnalyzeResponse,
+          status_code=200) # 요청 사양에 명시된 200 OK
+async def request_ai_analysis(
+    request: AiAnalyzeRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    [신규] App 서버로부터 AI 분석(STT + 화자분리 + 요약)을 요청받습니다.
+    
+    즉시 'processing' 상태를 응답하고, 백그라운드에서 실제 작업을 수행합니다.
+    작업 완료 시 App 서버의 '/api/meetings/{id}/callback'으로 결과를 POST합니다.
+    """
+    print(f"✅ AI 분석 요청 수신: {request.meetingId} (파일: {request.filePath})")
+    
+    # (보안 참고) 실제 운영 시, filePath가 허용된 디렉토리(예: /data/uploads/)
+    # 내에 있는지 엄격히 검사해야 합니다.
+    # 예: if not request.filePath.startswith("/data/uploads/"):
+    #        raise HTTPException(status_code=400, detail="Invalid filePath")
+    
+    # 백그라운드 작업 등록
+    background_tasks.add_task(
+        background_analysis_task, # 위에서 정의한 백그라운드 함수
+        request.meetingId,
+        request.filePath
+    )
+    
+    # 요청 사양대로 즉시 응답 반환
+    return AiAnalyzeResponse(status="processing")
+
+
+# ========================================
 
 if __name__ == "__main__":
     import uvicorn
