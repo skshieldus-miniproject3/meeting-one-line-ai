@@ -6,6 +6,7 @@
 import os
 import uuid
 import asyncio
+import json      # 임베딩 파일 처리용
 import requests  # [신규] 콜백 전송을 위해 추가
 import math      # [신규] 페이징 계산을 위해 추가
 from datetime import datetime
@@ -132,6 +133,12 @@ class SemanticSearchRequest(BaseModel):
     top_k: int = 5
 
 
+class UpdateEmbeddingRequest(BaseModel):
+    """임베딩 업데이트 요청 모델"""
+    summary: str  # 수정된 요약문
+    title: Optional[str] = None  # 수정된 제목 (선택)
+
+
 class JobResponse(BaseModel):
     """작업 응답 모델"""
     job_id: str
@@ -189,6 +196,7 @@ async def root():
             "/transcript/statistics",
             "/upload_and_analyze",
             "/search/semantic",  # 의미 기반 검색
+            "/embeddings/{meeting_id}",  # 임베딩 업데이트 (PUT)
             "/ai/analyze", # App 서버 연동 엔드포인트
             "/meetings"   # [신규] 회의록 목록 조회
         ]
@@ -325,6 +333,20 @@ async def background_analysis_task(meeting_id: str, file_path: str):
             unique_keywords = list(dict.fromkeys(filtered_keywords))
             # 상위 10개만
             callback_data["keywords"] = unique_keywords[:10]
+
+            # 임베딩 생성 및 저장
+            try:
+                print(f"[Task {meeting_id}] 임베딩 생성 및 저장 중...")
+                embedding = report_generator.generate_embedding(callback_data["summary"])
+                embedding_manager.save_meeting_embedding(
+                    meeting_id=meeting_id,
+                    title=Path(file_path).stem,
+                    summary=callback_data["summary"],
+                    embedding=embedding
+                )
+                print(f"[Task {meeting_id}] ✅ 임베딩 저장 완료")
+            except Exception as e:
+                print(f"[Task {meeting_id}] ⚠️ 임베딩 저장 실패: {e}")
 
         else:
             print(f"[Task {meeting_id}] 3. AI 요약기(OpenAI)가 없거나 대화록이 비어 요약을 건너뜁니다.")
@@ -751,6 +773,55 @@ async def semantic_search(request: SemanticSearchRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검색 실패: {str(e)}")
+
+
+@app.put("/embeddings/{meeting_id}")
+async def update_meeting_embedding(
+    meeting_id: str,
+    request: UpdateEmbeddingRequest
+):
+    """
+    회의록 수정 시 임베딩을 업데이트합니다.
+
+    백엔드에서 회의록(요약 또는 제목)을 수정한 후 호출합니다.
+    """
+    if not report_generator:
+        raise HTTPException(status_code=500, detail="OpenAI API 키가 설정되지 않았습니다")
+
+    try:
+        print(f"[UPDATE] 임베딩 업데이트 요청: {meeting_id}")
+
+        # 기존 임베딩 파일 로드 (제목 등 메타데이터 유지용)
+        existing_file = embedding_manager.embeddings_dir / f"meeting_{meeting_id}.json"
+        title = request.title
+
+        if not title and existing_file.exists():
+            # 제목이 없으면 기존 파일에서 가져오기
+            with open(existing_file, 'r', encoding='utf-8') as f:
+                existing_data = json.load(f)
+                title = existing_data.get("title", meeting_id)
+
+        # 새 임베딩 생성
+        embedding = report_generator.generate_embedding(request.summary)
+
+        # 임베딩 저장 (덮어쓰기)
+        embedding_manager.save_meeting_embedding(
+            meeting_id=meeting_id,
+            title=title or meeting_id,
+            summary=request.summary,
+            embedding=embedding
+        )
+
+        print(f"[UPDATE] ✅ 임베딩 업데이트 완료: {meeting_id}")
+
+        return {
+            "status": "success",
+            "message": f"임베딩이 업데이트되었습니다: {meeting_id}"
+        }
+
+    except Exception as e:
+        print(f"[UPDATE] ❌ 임베딩 업데이트 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"임베딩 업데이트 실패: {str(e)}")
 
 
 # ========================================
