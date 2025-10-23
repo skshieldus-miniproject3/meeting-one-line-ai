@@ -20,7 +20,8 @@ from fastapi import (
     Depends, Form, status, Query
 )
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field # [수정] Field 추가
+
 from dotenv import load_dotenv
 
 # --- [DB 연동 제거] ---
@@ -155,6 +156,7 @@ class AiAnalyzeRequest(BaseModel):
     meetingId: str
     filePath: str # 예: /data/uploads/meeting_123.wav
     userId: str   # [신규] App 서버가 인증을 통해 알아낸 사용자 ID
+    meetingTitle: Optional[str] = None # [신규 추가] 사용자가 입력한 원본 제목
 
 class AiAnalyzeResponse(BaseModel):
     """AI 분석 요청 즉시 응답 모델"""
@@ -164,13 +166,19 @@ class AiAnalyzeResponse(BaseModel):
 # 3.4 회의록 목록 조회를 위한 Pydantic 모델
 # ========================================
 
+class MeetingSpeakerItem(BaseModel):
+    """[신규] 목록에 표시할 간단한 화자 정보 모델"""
+    speakerId: str
+    name: Optional[str] = None
+
 class MeetingListItem(BaseModel):
-    """회의록 목록의 개별 항목 모델"""
+    """[수정] 회의록 목록의 개별 항목 모델"""
     meetingId: str
     title: str
     status: str
     summary: Optional[str] = None
     createdAt: str
+    speakers: List[MeetingSpeakerItem] = [] # [신규 수정] 화자 목록
 
 class MeetingListResponse(BaseModel):
     """회의록 목록 페이징 응답 모델"""
@@ -183,15 +191,36 @@ class MeetingListResponse(BaseModel):
 # 3.5 임베딩 동기화를 위한 Pydantic 모델
 # ========================================
 
+class SpeakerSegmentUpsert(BaseModel):
+    """
+    [신규] /embeddings/upsert에서 받을 segments 모델 (파싱용)
+    App 서버가 보내는 데이터를 받기 위함이며, 실제 저장되지는 않음.
+    """
+    start: Optional[float] = None
+    end: Optional[float] = None
+    text: Optional[str] = None
+
+class SpeakerUpsertData(BaseModel):
+    """
+    [신규] /embeddings/upsert 요청 시 받을 speaker 객체 모델
+    App 서버가 보내는 'segments'를 포함하여 파싱합니다.
+    """
+    speakerId: str
+    name: Optional[str] = None
+    segments: Optional[List[SpeakerSegmentUpsert]] = None # segments를 받도록 허용
+
 class EmbeddingUpsertRequest(BaseModel):
     """
     [수정] 임베딩 생성/수정 요청 모델
     """
     meetingId: str
-    userId: str # [신규] 사용자 ID
+    userId: str
     title: str
-    summary: str # DB에 저장된 최신 요약문
-    keywords: List[str] # [신규] App 서버가 관리하는 키워드 목록
+    summary: str
+    keywords: List[str]
+    # [수정] App 서버가 보내는 speaker 구조(SpeakerUpsertData)를 받도록 수정
+    speakers: Optional[List[SpeakerUpsertData]] = Field(default_factory=list)
+
 
 class EmbeddingSyncResponse(BaseModel):
     """임베딩 동기화 응답 모델"""
@@ -272,7 +301,7 @@ def format_clova_to_app_speakers(segments: list) -> list:
 
 
 # [수정] 비동기 작업으로 변경 (async def)
-async def background_analysis_task(meeting_id: str, file_path: str, user_id: str):
+async def background_analysis_task(meeting_id: str, file_path: str, user_id: str, meeting_title: Optional[str] = None):
     """
     [수정] 비동기 백그라운드 분석 작업
     (동기(차단) 함수들을 asyncio.to_thread로 실행하여 메인 루프 멈춤 방지)
@@ -317,6 +346,18 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
         
         # 2. 대화록(flat text) 변환 (AI 분석용)
         transcript = format_segments_to_transcript(segments)
+
+        # 4. 화자 데이터 포맷팅 (App 서버 요구사항)
+        # [수정] AI 분석 전에 먼저 실행 (speaker_name_data 생성을 위해)
+        print(f"[Task {meeting_id}] 6. 화자 데이터 포맷팅...")
+        callback_data["speakers"] = format_clova_to_app_speakers(segments)
+        
+        # [신규] 4.5. 임베딩 저장용 '화자 이름' 목록 생성 (segments 제외)
+        # 초기에는 name이 없으므로 speakerId와 name: None으로 저장
+        speaker_name_data = [
+            {"speakerId": s["speakerId"], "name": None} 
+            for s in callback_data["speakers"]
+        ]
         
         # 3. AI 분석 (요약 + 키워드)
         if report_generator and transcript:
@@ -353,15 +394,21 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
                     callback_data["summary"]
                 )
                 
+                # [신규] 전달받은 제목이 있으면 사용하고, 없으면 파일명 사용
+                # (최초 분석 시 meeting_title은 None이므로 local_path.stem이 사용됨)
+                title_to_save = meeting_title if meeting_title else local_path.stem
+                print(f"[Task {meeting_id}] 5. 저장될 제목: {title_to_save}")
+
                 # [수정] 임베딩 저장 (파일 I/O도 별도 스레드)
                 await asyncio.to_thread(
                     embedding_manager.save_meeting_embedding,
                     user_id=user_id, # [수정]
                     meeting_id=meeting_id,
-                    title=local_path.stem,
+                    title=title_to_save, # [수정]
                     summary=callback_data["summary"],
                     embedding=embedding_vector,
-                    keywords=callback_data["keywords"] # [신규] AI가 추출한 키워드도 저장
+                    keywords=callback_data["keywords"], # [신규] AI가 추출한 키워드도 저장
+                    speakers=speaker_name_data # [신규 추가] 초기 화자 목록 저장
                 )
                 print(f"[Task {meeting_id}] 5. 임베딩 저장 완료: {meeting_id}")
             except Exception as e:
@@ -370,9 +417,7 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
         else:
             print(f"[Task {meeting_id}] 3. AI 요약기(OpenAI)가 없거나 대화록이 비어 요약을 건너뜁니다.")
 
-        # 4. 화자 데이터 포맷팅 (App 서버 요구사항)
-        print(f"[Task {meeting_id}] 6. 화자 데이터 포맷팅...")
-        callback_data["speakers"] = format_clova_to_app_speakers(segments)
+        # [이동] 화자 데이터 포맷팅 (위로 이동함)
         
         callback_data["status"] = "completed"
         callback_data.pop("error") 
@@ -883,7 +928,7 @@ async def semantic_search(request: SemanticSearchRequest):
           response_model=AiAnalyzeResponse,
           status_code=200) 
 async def request_ai_analysis(
-    request: AiAnalyzeRequest, # [수정] AiAnalyzeRequest에 userId 포함됨
+    request: AiAnalyzeRequest, # [수정] AiAnalyzeRequest에 userId, meetingTitle 포함됨
     background_tasks: BackgroundTasks
 ):
     """
@@ -897,7 +942,8 @@ async def request_ai_analysis(
         background_analysis_task, 
         request.meetingId,
         request.filePath,
-        request.userId # [수정]
+        request.userId, # [수정]
+        request.meetingTitle # [신규 추가] 백그라운드 작업으로 제목 전달
     )
     
     return AiAnalyzeResponse(status="processing")
@@ -946,19 +992,28 @@ async def get_meeting_list(
                 except Exception as e:
                     print(f"파일 시간 읽기 오류: {meeting_id} - {e}")
             
+            # [신규] 저장된 화자 정보 로드
+            saved_speakers = meeting_data.get("speakers", [])
+            
             enriched_meetings.append({
                 "meetingId": meeting_id,
                 "title": meeting_data.get("title", ""),
                 "summary": meeting_data.get("summary", ""),
                 "status": "COMPLETED", # [수정] 임베딩이 저장된 것은 'COMPLETED'로 간주
-                "createdAt": created_at_iso
+                "createdAt": created_at_iso,
+                "speakers": saved_speakers # [신규 수정] 화자 정보 응답에 포함
             })
         
         # 3. 필터링 로직 (기존과 동일)
         filtered_meetings = enriched_meetings
         if keyword:
             kw = keyword.lower()
-            filtered_meetings = [m for m in filtered_meetings if kw in m['title'].lower() or kw in m['summary'].lower()]
+            filtered_meetings = [m for m in filtered_meetings 
+                                 if kw in m['title'].lower() 
+                                 or kw in m['summary'].lower()
+                                 # [신규] 화자 이름(name)으로도 검색
+                                 or any(kw in (s.get('name') or '').lower() for s in m['speakers'])
+                                ]
         if title:
             filtered_meetings = [m for m in filtered_meetings if title.lower() in m['title'].lower()]
         if summary:
@@ -998,10 +1053,11 @@ async def get_meeting_list(
 @app.post("/embeddings/upsert", 
           response_model=EmbeddingSyncResponse,
           status_code=status.HTTP_201_CREATED)
-async def upsert_embedding(request: EmbeddingUpsertRequest): # [수정] request에 userId, keywords 포함
+async def upsert_embedding(request: EmbeddingUpsertRequest): # [수정] request에 speakers 포함
     """
     [수정] 임베딩 생성 또는 수정 (Upsert) (비차단)
     (API 3.6 - 회의록 수정 시 App 서버가 이 API를 호출)
+    (App 서버가 보낸 'speakers' 객체에서 name을 추출하여 저장)
     """
     print(f"🔄 [SYNC] 임베딩 Upsert 요청: {request.meetingId} (User: {request.userId})")
     
@@ -1017,16 +1073,28 @@ async def upsert_embedding(request: EmbeddingUpsertRequest): # [수정] request�
             request.summary
         )
         
+        # [신규] App 서버가 보낸 'speakers' 목록에서 
+        # 'speakerId'와 'name'만 추출하여 저장할 데이터를 만듭니다.
+        # (segments는 임베딩 파일에 저장할 필요가 없음)
+        speaker_data_to_save = []
+        if request.speakers:
+            for speaker in request.speakers:
+                speaker_data_to_save.append({
+                    "speakerId": speaker.speakerId,
+                    "name": speaker.name
+                })
+        
         # [수정] 2. 사용자별 경로에 저장 (파일 I/O 비동기 스레드)
-        print(f"  - 2/2. 임베딩 파일 저장 중...")
+        print(f"  - 2/2. 임베딩 파일 저장 중 (화자 {len(speaker_data_to_save)}명 정보 포함)...")
         await asyncio.to_thread(
             embedding_manager.save_meeting_embedding,
             user_id=request.userId, # [수정]
             meeting_id=request.meetingId,
-            title=request.title,
+            title=request.title, # [수정] App 서버가 보낸 수정된 제목 사용
             summary=request.summary,
             embedding=embedding_vector,
-            keywords=request.keywords # [신규] App 서버가 보낸 키워드 저장
+            keywords=request.keywords, # [신규] App 서버가 보낸 키워드 저장
+            speakers=speaker_data_to_save # [신규 수정] 'speakerId'와 'name'만 추출한 데이터
         )
         
         print(f"  - ✅ [SYNC] Upsert 완료: {request.meetingId}")
