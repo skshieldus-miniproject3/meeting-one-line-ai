@@ -190,6 +190,7 @@ class EmbeddingUpsertRequest(BaseModel):
     userId: str # [신규] 사용자 ID
     title: str
     summary: str # DB에 저장된 최신 요약문
+    keywords: List[str] # [신규] App 서버가 관리하는 키워드 목록
 
 class EmbeddingSyncResponse(BaseModel):
     """임베딩 동기화 응답 모델"""
@@ -339,7 +340,8 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
                     meeting_id=meeting_id,
                     title=local_path.stem,
                     summary=callback_data["summary"],
-                    embedding=embedding_vector
+                    embedding=embedding_vector,
+                    keywords=callback_data["keywords"] # [신규] AI가 추출한 키워드도 저장
                 )
                 print(f"[Task {meeting_id}] 5. 임베딩 저장 완료: {meeting_id}")
             except Exception as e:
@@ -811,7 +813,7 @@ async def get_meeting_list(
                 "meetingId": meeting_id,
                 "title": meeting_data.get("title", ""),
                 "summary": meeting_data.get("summary", ""),
-                "status": "completed", # 임베딩이 저장된 것은 'completed'로 간주
+                "status": "COMPLETED", # [수정] 임베딩이 저장된 것은 'COMPLETED'로 간주
                 "createdAt": created_at_iso
             })
         
@@ -825,6 +827,7 @@ async def get_meeting_list(
         if summary:
             filtered_meetings = [m for m in filtered_meetings if summary.lower() in m['summary'].lower()]
         if status:
+            # [수정] 쿼리 파라미터(status)와 데이터(m['status'])를 모두 소문자(or 대문자)로 통일하여 비교
             filtered_meetings = [m for m in filtered_meetings if status.lower() == m['status'].lower()]
 
         # 4. 정렬 (최신순)
@@ -858,7 +861,7 @@ async def get_meeting_list(
 @app.post("/embeddings/upsert", 
           response_model=EmbeddingSyncResponse,
           status_code=status.HTTP_201_CREATED)
-async def upsert_embedding(request: EmbeddingUpsertRequest): # [수정] request에 userId 포함
+async def upsert_embedding(request: EmbeddingUpsertRequest): # [수정] request에 userId, keywords 포함
     """
     [수정] 임베딩 생성 또는 수정 (Upsert)
     (API 3.6 - 회의록 수정 시 App 서버가 이 API를 호출)
@@ -881,7 +884,8 @@ async def upsert_embedding(request: EmbeddingUpsertRequest): # [수정] request�
             meeting_id=request.meetingId,
             title=request.title,
             summary=request.summary,
-            embedding=embedding_vector
+            embedding=embedding_vector,
+            keywords=request.keywords # [신규] App 서버가 보낸 키워드 저장
         )
         
         print(f"  - ✅ [SYNC] Upsert 완료: {request.meetingId}")

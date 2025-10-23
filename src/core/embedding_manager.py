@@ -49,7 +49,8 @@ class EmbeddingManager:
         title: str,
         summary: str,
         embedding: List[float],
-        segments: Optional[List[Dict]] = None
+        segments: Optional[List[Dict]] = None,
+        keywords: Optional[List[str]] = None # [신규]
     ) -> None:
         """
         [수정] 특정 사용자의 회의록 임베딩을 저장합니다.
@@ -61,6 +62,7 @@ class EmbeddingManager:
             summary: 회의 요약
             embedding: 임베딩 벡터
             segments: 세그먼트별 임베딩 (선택사항)
+            keywords: 키워드 리스트 (선택사항)
         """
         data = {
             "meeting_id": meeting_id,
@@ -68,7 +70,8 @@ class EmbeddingManager:
             "title": title,
             "summary": summary,
             "embedding": embedding,
-            "segments": segments or []
+            "segments": segments or [],
+            "keywords": keywords or [] # [신규]
         }
         
         # 사용자별 디렉토리 경로
