@@ -3,6 +3,7 @@
 [수정됨] /meetings 회의록 목록 조회 엔드포인트 추가
 [신규] /embeddings/** 백엔드 DB - AI 서버 임베딩 동기화 엔드포인트 추가
 [수정] 2024-10-23: 모든 데이터 처리에 userId 적용 (사용자별 데이터 분리)
+[수정] 2025-10-27: background_analysis_task에 추가 AI 기능(액션 아이템, 회의록, 감정 분석, 주제 분류, 후속 질문) 호출 추가
 """
 
 import os
@@ -41,6 +42,7 @@ from src.core.formatter import (
     extract_speaker_statistics,
     generate_meeting_summary_header
 )
+# [수정] LangChain 버전의 ReportGenerator import 확인
 from src.core.ai_analyzer import ReportGenerator, ReportGeneratorError
 from src.core.embedding_manager import EmbeddingManager
 
@@ -55,7 +57,7 @@ load_dotenv()
 app = FastAPI(
     title="CLOVA Speech STT API",
     description="NAVER Cloud Platform CLOVA Speech API 서버 (사용자별 데이터 분리 적용)",
-    version="2.0.0" # [수정] 버전 업데이트 (사용자 분리)
+    version="2.2.0" # [수정] 버전 업데이트 (후속 질문 추가)
 )
 
 # 글로벌 설정
@@ -72,7 +74,8 @@ client = ClovaSpeechClient(INVOKE_URL, SECRET_KEY)
 # AI 보고서 생성기 (OpenAI 키가 있는 경우에만)
 try:
     report_generator = ReportGenerator()
-except Exception:
+except Exception as e:
+    print(f"⚠️ ReportGenerator 초기화 실패: {e}. AI 분석 기능이 제한될 수 있습니다.")
     report_generator = None
 
 # 임베딩 관리자
@@ -237,7 +240,7 @@ async def root():
     """루트 엔드포인트"""
     return {
         "service": "CLOVA Speech STT API",
-        "version": "2.0.0", # [수정] 버전 업데이트
+        "version": "2.2.0", # [수정] 버전 업데이트
         "endpoints": [
             "/stt/url",
             "/stt/file",
@@ -271,21 +274,21 @@ def format_clova_to_app_speakers(segments: list) -> list:
     """CLOVA STT segments를 App 서버 콜백('speakers') 형식으로 변환합니다."""
     # (기존 코드와 동일 - 변경 없음)
     speakers_dict = {}
-    
+
     if not segments:
         return []
-        
+
     for segment in segments:
         try:
             speaker_label = segment.get("speaker", {}).get("label", "Unknown")
-            speaker_id = f"S{speaker_label}" 
-            
+            speaker_id = f"S{speaker_label}"
+
             if speaker_id not in speakers_dict:
                 speakers_dict[speaker_id] = {"speakerId": speaker_id, "segments": []}
-            
+
             start_sec = segment.get("start", 0) / 1000.0
             end_sec = segment.get("end", 0) / 1000.0
-            
+
             speakers_dict[speaker_id]["segments"].append({
                 "start": round(start_sec, 2),
                 "end": round(end_sec, 2),
@@ -300,23 +303,30 @@ def format_clova_to_app_speakers(segments: list) -> list:
     return list(speakers_dict.values())
 
 
-# [수정] 비동기 작업으로 변경 (async def)
+# [수정] 비동기 작업으로 변경 (async def) + 추가 AI 기능 호출 + 후속 질문 추가
 async def background_analysis_task(meeting_id: str, file_path: str, user_id: str, meeting_title: Optional[str] = None):
     """
-    [수정] 비동기 백그라운드 분석 작업
+    [수정] 비동기 백그라운드 분석 작업 + 추가 AI 기능 호출 + 후속 질문 추가
     (동기(차단) 함수들을 asyncio.to_thread로 실행하여 메인 루프 멈춤 방지)
     """
     print(f"[Task {meeting_id}] AI 분석 작업 시작 (User: {user_id}): {file_path}")
-    
-    # App 서버로 전송할 콜백 데이터
+
+    # App 서버로 전송할 콜백 데이터 (기본값 설정)
     callback_data = {
         "status": "failed", # 기본값 'failed'
         "summary": None,
         "keywords": [],
         "speakers": [],
+        # --- [신규] 추가될 필드들 ---
+        "actionItems": None,
+        "meetingNotes": None,
+        "sentiment": None,
+        "topics": None,
+        "followUpQuestions": None, # <<< [신규] 후속 질문 필드 추가
+        # ---------------------------
         "error": None
     }
-    
+
     try:
         # 0. 파일 경로 유효성 검사 (AI 서버 로컬 경로)
         local_path = Path(file_path)
@@ -330,125 +340,176 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
             'fullText': True, 'enable_diarization': True,
             'diarization': {'enable': True, 'speakerCountMin': 2, 'speakerCountMax': 10}
         }
-        
-        # [수정] 동기(차단) 함수를 별도 스레드에서 실행
         stt_result = await asyncio.to_thread(
-            client.request_by_file, 
-            local_path, 
+            client.request_by_file,
+            local_path,
             **stt_options
         )
-        
         if 'segments' not in stt_result or not stt_result['segments']:
             raise ValueError("STT 실패: Clova 결과에 'segments'가 없습니다.")
-        
         segments = stt_result.get('segments', [])
         print(f"[Task {meeting_id}] 2. STT 완료 (세그먼트 {len(segments)}개)")
-        
+
         # 2. 대화록(flat text) 변환 (AI 분석용)
         transcript = format_segments_to_transcript(segments)
+        if not transcript:
+             print(f"[Task {meeting_id}] ⚠️ 대화록이 비어있어 AI 분석을 건너뜁니다.")
+             callback_data["speakers"] = format_clova_to_app_speakers(segments)
+             callback_data["status"] = "completed_no_transcript"
+             callback_data.pop("error")
+             return
 
         # 4. 화자 데이터 포맷팅 (App 서버 요구사항)
-        # [수정] AI 분석 전에 먼저 실행 (speaker_name_data 생성을 위해)
-        print(f"[Task {meeting_id}] 6. 화자 데이터 포맷팅...")
+        print(f"[Task {meeting_id}] 4. 화자 데이터 포맷팅...")
         callback_data["speakers"] = format_clova_to_app_speakers(segments)
-        
+
         # [신규] 4.5. 임베딩 저장용 '화자 이름' 목록 생성 (segments 제외)
-        # 초기에는 name이 없으므로 speakerId와 name: None으로 저장
         speaker_name_data = [
-            {"speakerId": s["speakerId"], "name": None} 
+            {"speakerId": s["speakerId"], "name": None}
             for s in callback_data["speakers"]
         ]
-        
-        # 3. AI 분석 (요약 + 키워드)
-        if report_generator and transcript:
-            print(f"[Task {meeting_id}] 3. AI 요약(OpenAI) 시작...")
-            # [수정] 3a. 요약 (별도 스레드)
-            summary_text = await asyncio.to_thread(
-                report_generator.summarize,
-                transcript
-            )
-            callback_data["summary"] = summary_text
-            
-            print(f"[Task {meeting_id}] 4. AI 키워드 추출(OpenAI) 시작...")
-            # [수정] 3b. 키워드 (별도 스레드)
-            keyword_text = await asyncio.to_thread(
-                report_generator.extract_keywords,
-                transcript
-            )
-            raw_keywords = [line.strip().lstrip('-•* ').strip() for line in keyword_text.split('\n') if line.strip().lstrip('-•* ').strip()]
-            filtered_keywords = [
-                kw for kw in raw_keywords
-                if not kw.endswith(':')
-                and len(kw) <= 30
-                and (kw.count('.') + kw.count(',')) < 2
-            ]
-            unique_keywords = list(dict.fromkeys(filtered_keywords))
-            callback_data["keywords"] = unique_keywords[:10]
-            
-            # [수정] 3.5.1 : AI 분석 완료 시, 임베딩도 자동으로 '사용자별'로 저장
-            try:
-                print(f"[Task {meeting_id}] 5. AI 분석 완료, 임베딩 저장 시작 (User: {user_id})")
-                # [수정] 임베딩 생성 (별도 스레드)
-                embedding_vector = await asyncio.to_thread(
-                    report_generator.generate_embedding,
-                    callback_data["summary"]
-                )
-                
-                # [신규] 전달받은 제목이 있으면 사용하고, 없으면 파일명 사용
-                # (최초 분석 시 meeting_title은 None이므로 local_path.stem이 사용됨)
-                title_to_save = meeting_title if meeting_title else local_path.stem
-                print(f"[Task {meeting_id}] 5. 저장될 제목: {title_to_save}")
 
-                # [수정] 임베딩 저장 (파일 I/O도 별도 스레드)
-                await asyncio.to_thread(
-                    embedding_manager.save_meeting_embedding,
-                    user_id=user_id, # [수정]
-                    meeting_id=meeting_id,
-                    title=title_to_save, # [수정]
-                    summary=callback_data["summary"],
-                    embedding=embedding_vector,
-                    keywords=callback_data["keywords"], # [신규] AI가 추출한 키워드도 저장
-                    speakers=speaker_name_data # [신규 추가] 초기 화자 목록 저장
-                )
-                print(f"[Task {meeting_id}] 5. 임베딩 저장 완료: {meeting_id}")
-            except Exception as e:
-                print(f"[Task {meeting_id}] ⚠️ 5. 임베딩 저장 실패: {e}")
+        # 3. AI 분석 (요약 + 키워드 + 추가 기능들 + 후속 질문)
+        if report_generator:
+            analysis_tasks = []
+
+            # --- 기존 분석 ---
+            print(f"[Task {meeting_id}] 3a. AI 요약(LangChain) 시작...")
+            analysis_tasks.append(asyncio.to_thread(report_generator.summarize, transcript))
+
+            print(f"[Task {meeting_id}] 3b. AI 키워드 추출(LangChain) 시작...")
+            analysis_tasks.append(asyncio.to_thread(report_generator.extract_keywords, transcript))
+
+            # --- [신규] 추가 분석 ---
+            print(f"[Task {meeting_id}] 3c. AI 액션 아이템 추출(LangChain) 시작...")
+            analysis_tasks.append(asyncio.to_thread(report_generator.generate_action_items, transcript))
+
+            print(f"[Task {meeting_id}] 3d. AI 회의록 생성(LangChain) 시작...")
+            analysis_tasks.append(asyncio.to_thread(report_generator.generate_meeting_notes, transcript))
+
+            print(f"[Task {meeting_id}] 3e. AI 감정 분석(LangChain) 시작...")
+            analysis_tasks.append(asyncio.to_thread(report_generator.analyze_sentiment, transcript))
+
+            print(f"[Task {meeting_id}] 3f. AI 주제 분류(LangChain) 시작...")
+            analysis_tasks.append(asyncio.to_thread(report_generator.classify_topics, transcript))
+
+            # --- <<< [신규] 후속 질문 분석 추가 ---
+            print(f"[Task {meeting_id}] 3g. AI 후속 질문 생성(LangChain) 시작...")
+            analysis_tasks.append(asyncio.to_thread(report_generator.generate_follow_up_questions, transcript))
+            # ----------------------------------
+
+            # 병렬 실행 (결과는 순서대로 리스트에 담김)
+            print(f"[Task {meeting_id}] 3h. AI 분석 병렬 실행...") # <<< 인덱스 수정
+            results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+
+            # 결과 매핑 (오류 발생 시 None 또는 기본값 할당)
+            if isinstance(results[0], Exception):
+                print(f"[Task {meeting_id}] ⚠️ 요약 생성 실패: {results[0]}")
+            else:
+                callback_data["summary"] = results[0]
+
+            if isinstance(results[1], Exception):
+                print(f"[Task {meeting_id}] ⚠️ 키워드 추출 실패: {results[1]}")
+            else:
+                keyword_text = results[1]
+                raw_keywords = [line.strip().lstrip('-•* ').strip() for line in keyword_text.split('\n') if line.strip().lstrip('-•* ').strip()]
+                filtered_keywords = [
+                    kw for kw in raw_keywords
+                    if not kw.endswith(':')
+                    and len(kw) <= 30
+                    and (kw.count('.') + kw.count(',')) < 2
+                ]
+                unique_keywords = list(dict.fromkeys(filtered_keywords))
+                callback_data["keywords"] = unique_keywords[:10]
+
+            # --- [신규] 결과 매핑 ---
+            if isinstance(results[2], Exception):
+                print(f"[Task {meeting_id}] ⚠️ 액션 아이템 추출 실패: {results[2]}")
+            else:
+                callback_data["actionItems"] = results[2]
+
+            if isinstance(results[3], Exception):
+                print(f"[Task {meeting_id}] ⚠️ 회의록 생성 실패: {results[3]}")
+            else:
+                callback_data["meetingNotes"] = results[3]
+
+            if isinstance(results[4], Exception):
+                print(f"[Task {meeting_id}] ⚠️ 감정 분석 실패: {results[4]}")
+            else:
+                callback_data["sentiment"] = results[4]
+
+            if isinstance(results[5], Exception):
+                print(f"[Task {meeting_id}] ⚠️ 주제 분류 실패: {results[5]}")
+            else:
+                callback_data["topics"] = results[5]
+
+            # --- <<< [신규] 후속 질문 결과 매핑 ---
+            if isinstance(results[6], Exception): # <<< 인덱스 수정
+                print(f"[Task {meeting_id}] ⚠️ 후속 질문 생성 실패: {results[6]}") # <<< 인덱스 수정
+            else:
+                callback_data["followUpQuestions"] = results[6] # <<< 인덱스 수정, 백엔드 DTO 필드명과 일치 필요
+            # -----------------------------------
+
+            # 5. 임베딩 저장 (요약이 성공했을 경우에만 시도)
+            if callback_data["summary"]:
+                try:
+                    print(f"[Task {meeting_id}] 5. 임베딩 저장 시작 (User: {user_id})")
+                    embedding_vector = await asyncio.to_thread(
+                        report_generator.generate_embedding,
+                        callback_data["summary"]
+                    )
+                    title_to_save = meeting_title if meeting_title else local_path.stem
+                    print(f"[Task {meeting_id}] 5. 저장될 제목: {title_to_save}")
+
+                    await asyncio.to_thread(
+                        embedding_manager.save_meeting_embedding,
+                        user_id=user_id,
+                        meeting_id=meeting_id,
+                        title=title_to_save,
+                        summary=callback_data["summary"],
+                        embedding=embedding_vector,
+                        keywords=callback_data["keywords"],
+                        speakers=speaker_name_data
+                    )
+                    print(f"[Task {meeting_id}] 5. 임베딩 저장 완료: {meeting_id}")
+                except Exception as e:
+                    print(f"[Task {meeting_id}] ⚠️ 5. 임베딩 저장 실패: {e}")
+            else:
+                 print(f"[Task {meeting_id}] ⚠️ 요약이 없어 임베딩 저장을 건너뜁니다.")
+
 
         else:
-            print(f"[Task {meeting_id}] 3. AI 요약기(OpenAI)가 없거나 대화록이 비어 요약을 건너뜁니다.")
+            print(f"[Task {meeting_id}] ⚠️ AI 분석기(ReportGenerator)가 없어 AI 분석을 건너뜁니다.")
 
-        # [이동] 화자 데이터 포맷팅 (위로 이동함)
-        
         callback_data["status"] = "completed"
-        callback_data.pop("error") 
+        callback_data.pop("error") # 성공 시 에러 필드 제거
 
     except Exception as e:
-        print(f"[Task {meeting_id}] ❌ 분석 중 오류 발생: {e}")
+        print(f"[Task {meeting_id}] ❌ 분석 중 심각한 오류 발생: {e}")
         callback_data["error"] = str(e)
-        callback_data["status"] = "failed"
-    
-    # 5. App 서버로 콜백 전송 (API 문서 3.3)
-    if not APP_SERVER_CALLBACK_HOST:
-        print(f"[Task {meeting_id}] ⚠️ .env에 APP_SERVER_CALLBACK_HOST가 설정되지 않아 콜백을 보낼 수 없습니다.")
-        return
-        
-    callback_url = f"{APP_SERVER_CALLBACK_HOST}/api/meetings/{meeting_id}/callback"
-    
-    # [수정] requests(동기) 대신 httpx(비동기)를 사용하여 콜백 전송
-    try:
-        async with httpx.AsyncClient() as async_client:
-            print(f"[Task {meeting_id}] 7. App 서버로 콜백 전송: {callback_url}")
-            response = await async_client.post(callback_url, json=callback_data, timeout=15)
-            response.raise_for_status() # 2xx 외에는 에러 발생
-            print(f"[Task {meeting_id}] 8. 콜백 전송 성공 (App 서버 응답: {response.status_code})")
-    except httpx.RequestError as e:
-        print(f"[Task {meeting_id}] ❌ 8. 콜백 전송 실패 (HTTPX 오류): {e}")
-    except Exception as e:
-        print(f"[Task {meeting_id}] ❌ 8. 콜백 전송 실패 (일반 오류): {e}")
+        # 상태는 'failed' 유지
+    finally:
+        # 6. App 서버로 콜백 전송 (성공/실패/일부 성공 모두 전송 시도)
+        if not APP_SERVER_CALLBACK_HOST:
+            print(f"[Task {meeting_id}] ⚠️ .env에 APP_SERVER_CALLBACK_HOST가 설정되지 않아 콜백을 보낼 수 없습니다.")
+            return
+
+        callback_url = f"{APP_SERVER_CALLBACK_HOST}/api/meetings/{meeting_id}/callback"
+
+        try:
+            async with httpx.AsyncClient() as async_client:
+                print(f"[Task {meeting_id}] 6. App 서버로 콜백 전송: {callback_url}")
+                response = await async_client.post(callback_url, json=callback_data, timeout=15)
+                response.raise_for_status()
+                print(f"[Task {meeting_id}] 7. 콜백 전송 성공 (App 서버 응답: {response.status_code})")
+        except httpx.RequestError as e:
+            print(f"[Task {meeting_id}] ❌ 7. 콜백 전송 실패 (HTTPX 오류): {e}")
+        except Exception as e:
+            print(f"[Task {meeting_id}] ❌ 7. 콜백 전송 실패 (일반 오류): {e}")
 
 
 # ========================================
-# (기존 엔드포인트 - 변경 없음)
+# (기존 엔드포인트 - 대부분 변경 없음)
 # ========================================
 
 @app.post("/stt/url")
@@ -481,8 +542,6 @@ async def transcribe_url(request: URLRequest, background_tasks: BackgroundTasks)
                 'status': 'processing', 'created_at': datetime.now().isoformat(),
                 'type': 'url', 'url': str(request.url), 'options': options, 'result': None
             }
-            # [수정] 비동기 작업을 BackgroundTasks에 추가
-            # (이 엔드포인트는 /ai/analyze와 무관한 기존 엔드포인트이므로 poll_result 유지)
             background_tasks.add_task(poll_result, job_id)
             return JobResponse(job_id=job_id, status='processing', created_at=job_store[job_id]['created_at'])
     except ClovaSpeechError as e:
@@ -515,7 +574,6 @@ async def transcribe_file(
         temp_dir.mkdir(exist_ok=True)
         temp_file = temp_dir / f"{uuid.uuid4()}_{file.filename}"
 
-        # [수정] 파일 I/O를 비동기로 처리 (FastAPI 권장 사항)
         content = await file.read()
         with open(temp_file, "wb") as f:
             f.write(content)
@@ -530,10 +588,9 @@ async def transcribe_file(
         if callback: options['callback'] = callback
         if userdata: options['userdata'] = userdata
 
-        # [수정] 동기(차단) 함수를 별도 스레드에서 실행
         result = await asyncio.to_thread(
-            client.request_by_file, 
-            temp_file, 
+            client.request_by_file,
+            temp_file,
             **options
         )
 
@@ -555,7 +612,6 @@ async def transcribe_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"내부 서버 오류: {e}")
     finally:
-        # 비동기 모드에서는 poll_result가, 동기 모드에서는 이 블록이 파일을 삭제함
         if completion == 'sync' and temp_file and temp_file.exists():
              temp_file.unlink(missing_ok=True)
 
@@ -575,11 +631,10 @@ async def get_job_status(job_id: str):
         return JobResponse(job_id=job_id, status=job_info['status'], created_at=job_info['created_at'])
 
 
-# [수정] poll_result도 비동기(async def)로 변경 (내부의 get_result가 차단되므로)
 async def poll_result(job_id: str):
     """[수정] 백그라운드에서 비동기 작업 결과 폴링 (비차단)"""
+    # (기존 코드와 동일 - 변경 없음)
     try:
-        # [수정] 동기(차단) 함수를 별도 스레드에서 실행
         result = await asyncio.to_thread(
             client.wait_for_completion,
             job_id,
@@ -602,7 +657,7 @@ async def poll_result(job_id: str):
 async def startup():
     """서버 시작 시 실행 (DB 초기화 제거)"""
     # (기존 코드와 동일 - 변경 없음)
-    print("CLOVA Speech STT API server started (v2.0.0 - User-Specific)")
+    print(f"CLOVA Speech STT API server started (v{app.version} - User-Specific + Extra AI + Follow-up Qs)") # <<< 버전 로그 수정
     print(f"Invoke URL: {INVOKE_URL}")
     if APP_SERVER_CALLBACK_HOST:
         print(f"[CALLBACK] App Server Host: {APP_SERVER_CALLBACK_HOST}")
@@ -628,7 +683,8 @@ async def shutdown():
 @app.post("/meeting/transcribe")
 async def transcribe_meeting(request: MeetingRequest, background_tasks: BackgroundTasks):
     """
-    [수정] 회의 오디오 전사 및 AI 요약 (비차단)
+    [수정] 회의 오디오 전사 및 AI 요약 (비차단, **모든 AI 분석 포함**)
+    (이 엔드포인트는 /ai/analyze와 달리 userId를 받지 않으므로 임베딩 저장은 하지 않음)
     """
     try:
         options = {
@@ -636,17 +692,16 @@ async def transcribe_meeting(request: MeetingRequest, background_tasks: Backgrou
             'fullText': True, 'enable_diarization': True, 'enable_noise_filtering': True,
             'diarization': {'enable': True, 'speakerCountMin': request.speaker_count_min, 'speakerCountMax': request.speaker_count_max}
         }
-        
-        # [수정] STT 요청을 비동기(스레드)로 처리
+
         stt_result = await asyncio.to_thread(
-            client.request_by_url, 
-            str(request.url), 
+            client.request_by_url,
+            str(request.url),
             **options
         )
 
         if 'segments' not in stt_result:
             raise HTTPException(status_code=400, detail="STT 결과에 segments가 없습니다")
-        
+
         segments = stt_result['segments']
         transcript = format_segments_to_transcript(segments)
         detailed_transcript = format_segments_to_detailed_transcript(segments, include_timestamps=True, include_confidence=True)
@@ -655,43 +710,49 @@ async def transcribe_meeting(request: MeetingRequest, background_tasks: Backgrou
             'stt_result': stt_result, 'transcript': transcript, 'detailed_transcript': detailed_transcript,
             'speaker_statistics': speaker_stats, 'meeting_header': generate_meeting_summary_header(segments, request.meeting_title)
         }
-        
-        if request.include_ai_summary and report_generator:
-            try:
-                # [수정] AI 요약 함수들도 비동기(스레드)로 처리
-                summary_task = asyncio.to_thread(report_generator.summarize, transcript)
-                notes_task = asyncio.to_thread(report_generator.generate_meeting_notes, transcript)
-                action_task = asyncio.to_thread(report_generator.generate_action_items, transcript)
-                sentiment_task = asyncio.to_thread(report_generator.analyze_sentiment, transcript)
-                followup_task = asyncio.to_thread(report_generator.generate_follow_up_questions, transcript)
-                keywords_task = asyncio.to_thread(report_generator.extract_keywords, transcript)
-                topics_task = asyncio.to_thread(report_generator.classify_topics, transcript)
-                speaker_analysis_task = asyncio.to_thread(report_generator.analyze_by_speaker, transcript)
-                type_task = asyncio.to_thread(report_generator.classify_meeting_type, transcript)
-                speaker_summary_task = asyncio.to_thread(report_generator.summarize_by_speaker, transcript)
 
-                # 병렬 실행
-                results = await asyncio.gather(
-                    summary_task, notes_task, action_task, sentiment_task, followup_task,
-                    keywords_task, topics_task, speaker_analysis_task, type_task, speaker_summary_task
-                )
-                
-                ai_reports = {
-                    'summary': results[0],
-                    'meeting_notes': results[1],
-                    'action_items': results[2],
-                    'sentiment': results[3],
-                    'follow_up_questions': results[4],
-                    'keywords': results[5],
-                    'topics': results[6],
-                    'by_speaker': results[7],
-                    'meeting_type': results[8],
-                    'speaker_summary': results[9]
-                }
-                response_data['ai_reports'] = ai_reports
-            except Exception as e:
-                response_data['ai_reports_error'] = f"AI 요약 생성 실패: {str(e)}"
-        
+        if request.include_ai_summary and report_generator and transcript:
+            print(f"[/meeting/transcribe] 모든 AI 분석 병렬 실행 시작...")
+            analysis_tasks = [
+                asyncio.to_thread(report_generator.summarize, transcript),
+                asyncio.to_thread(report_generator.generate_meeting_notes, transcript),
+                asyncio.to_thread(report_generator.generate_action_items, transcript),
+                asyncio.to_thread(report_generator.analyze_sentiment, transcript),
+                asyncio.to_thread(report_generator.generate_follow_up_questions, transcript), # <<< 후속 질문 추가됨
+                asyncio.to_thread(report_generator.extract_keywords, transcript),
+                asyncio.to_thread(report_generator.classify_topics, transcript),
+                asyncio.to_thread(report_generator.analyze_by_speaker, transcript),
+                asyncio.to_thread(report_generator.classify_meeting_type, transcript),
+                asyncio.to_thread(report_generator.summarize_by_speaker, transcript),
+                asyncio.to_thread(report_generator.calculate_engagement_score, transcript),
+                asyncio.to_thread(report_generator.generate_improvement_suggestions, transcript)
+            ]
+
+            results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+
+            # 결과 매핑 (오류 시 에러 메시지 포함) - <<< 인덱스 유지됨 (follow_up_questions가 중간에 추가)
+            ai_reports = {
+                'summary': results[0] if not isinstance(results[0], Exception) else f"Error: {results[0]}",
+                'meeting_notes': results[1] if not isinstance(results[1], Exception) else f"Error: {results[1]}",
+                'action_items': results[2] if not isinstance(results[2], Exception) else f"Error: {results[2]}",
+                'sentiment': results[3] if not isinstance(results[3], Exception) else f"Error: {results[3]}",
+                'follow_up_questions': results[4] if not isinstance(results[4], Exception) else f"Error: {results[4]}", # <<< 추가됨
+                'keywords': results[5] if not isinstance(results[5], Exception) else f"Error: {results[5]}",
+                'topics': results[6] if not isinstance(results[6], Exception) else f"Error: {results[6]}",
+                'by_speaker': results[7] if not isinstance(results[7], Exception) else f"Error: {results[7]}",
+                'meeting_type': results[8] if not isinstance(results[8], Exception) else f"Error: {results[8]}",
+                'speaker_summary': results[9] if not isinstance(results[9], Exception) else f"Error: {results[9]}",
+                'engagement_score': results[10] if not isinstance(results[10], Exception) else f"Error: {results[10]}",
+                'improvement_suggestions': results[11] if not isinstance(results[11], Exception) else f"Error: {results[11]}"
+            }
+            response_data['ai_reports'] = ai_reports
+            print(f"[/meeting/transcribe] 모든 AI 분석 완료.")
+        elif not transcript:
+             response_data['ai_reports_error'] = "대화록이 비어있어 AI 분석을 건너뛰었습니다."
+        elif not report_generator:
+             response_data['ai_reports_error'] = "AI 분석기(ReportGenerator)가 설정되지 않았습니다."
+
+
         return JSONResponse(content=response_data)
 
     except ClovaSpeechError as e:
@@ -703,7 +764,7 @@ async def transcribe_meeting(request: MeetingRequest, background_tasks: Backgrou
 @app.post("/transcript/format")
 async def format_transcript(request: TranscriptFormatRequest):
     """STT segments 포맷팅 (DB 무관)"""
-    # (기존 코드와 동일 - 변경 없음, CPU bound 작업이라 빠름)
+    # (기존 코드와 동일 - 변경 없음)
     try:
         segments = request.segments
         if request.format_type == "basic":
@@ -723,7 +784,7 @@ async def format_transcript(request: TranscriptFormatRequest):
 @app.post("/transcript/summarize")
 async def summarize_transcript(request: SummaryRequest):
     """
-    [수정] 대화록 AI 요약 및 분석 (비차단)
+    [수정] 대화록 AI 요약 및 분석 (비차단) - 모든 분석 타입 지원
     """
     if not report_generator:
         raise HTTPException(status_code=503, detail="AI 요약 기능을 사용할 수 없습니다. OPENAI_API_KEY를 설정해주세요.")
@@ -731,14 +792,14 @@ async def summarize_transcript(request: SummaryRequest):
     try:
         transcript = request.transcript
         summary_type = request.summary_type
-        
-        # [수정] 모든 LLM 호출을 비동기(스레드)로 처리
+
+        # 모든 분석 함수 매핑 (순서 유지)
         call_map = {
             "summary": report_generator.summarize,
             "meeting_notes": report_generator.generate_meeting_notes,
             "action_items": report_generator.generate_action_items,
             "sentiment": report_generator.analyze_sentiment,
-            "follow_up": report_generator.generate_follow_up_questions,
+            "follow_up": report_generator.generate_follow_up_questions, # <<< 'follow_up' 키로 호출
             "keywords": report_generator.extract_keywords,
             "topics": report_generator.classify_topics,
             "by_speaker": report_generator.analyze_by_speaker,
@@ -747,10 +808,12 @@ async def summarize_transcript(request: SummaryRequest):
             "engagement_score": report_generator.calculate_engagement_score,
             "improvement_suggestions": report_generator.generate_improvement_suggestions,
         }
-        
+
         func_to_call = call_map.get(summary_type)
         if not func_to_call:
-            raise HTTPException(status_code=400, detail="지원하지 않는 summary_type입니다")
+             supported_types = list(call_map.keys())
+             raise HTTPException(status_code=400,
+                                 detail=f"지원하지 않는 summary_type입니다. 사용 가능한 타입: {', '.join(supported_types)}")
 
         result = await asyncio.to_thread(func_to_call, transcript)
 
@@ -765,7 +828,7 @@ async def summarize_transcript(request: SummaryRequest):
 @app.post("/transcript/statistics")
 async def get_transcript_statistics(segments: list):
     """대화록 통계 정보 추출 (DB 무관)"""
-    # (기존 코드와 동일 - 변경 없음, CPU bound 작업이라 빠름)
+    # (기존 코드와 동일 - 변경 없음)
     try:
         stats = extract_speaker_statistics(segments)
         header = generate_meeting_summary_header(segments)
@@ -782,20 +845,18 @@ async def upload_and_analyze(
     speaker_count_max: int = Form(10)
 ):
     """
-    [수정] 파일 업로드 + STT + 전체 AI 분석 (비차단)
+    [수정] 파일 업로드 + STT + 전체 AI 분석 (비차단, **모든 AI 분석 포함**)
     (이 엔드포인트는 사용자 분리 로직이 없습니다.)
     """
     if not report_generator:
         raise HTTPException(status_code=503, detail="AI 요약 기능을 사용할 수 없습니다. OPENAI_API_KEY를 설정해주세요.")
-    
+
     temp_file = None
     try:
         # 1. 파일 임시 저장
         temp_dir = Path("temp")
         temp_dir.mkdir(exist_ok=True)
         temp_file = temp_dir / f"{uuid.uuid4()}_{file.filename}"
-        
-        # [수정] 파일 I/O 비동기 처리
         content = await file.read()
         with open(temp_file, "wb") as f:
             f.write(content)
@@ -806,23 +867,19 @@ async def upload_and_analyze(
             'enable_diarization': True, 'enable_noise_filtering': True,
             'diarization': {'enable': True, 'speakerCountMin': speaker_count_min, 'speakerCountMax': speaker_count_max}
         }
-        
-        # [수정] STT 호출 비동기(스레드) 처리
         stt_result = await asyncio.to_thread(
-            client.request_by_file, 
-            temp_file, 
+            client.request_by_file,
+            temp_file,
             **options
         )
 
     except ClovaSpeechError as e:
-        # 임시 파일 삭제 후 에러 발생
         if temp_file and temp_file.exists(): temp_file.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"STT 오류: {e}")
     except Exception as e:
         if temp_file and temp_file.exists(): temp_file.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"파일 처리 또는 STT 오류: {e}")
     finally:
-        # 성공 시 임시 파일 삭제
         if temp_file and temp_file.exists():
             temp_file.unlink(missing_ok=True)
 
@@ -837,38 +894,45 @@ async def upload_and_analyze(
     ai_reports_error = None
 
     # 3. AI 전체 분석 실행 (병렬)
-    try:
-        # [수정] AI 요약 함수들도 비동기(스레드)로 처리
-        summary_task = asyncio.to_thread(report_generator.summarize, transcript)
-        notes_task = asyncio.to_thread(report_generator.generate_meeting_notes, transcript)
-        action_task = asyncio.to_thread(report_generator.generate_action_items, transcript)
-        sentiment_task = asyncio.to_thread(report_generator.analyze_sentiment, transcript)
-        followup_task = asyncio.to_thread(report_generator.generate_follow_up_questions, transcript)
-        keywords_task = asyncio.to_thread(report_generator.extract_keywords, transcript)
-        topics_task = asyncio.to_thread(report_generator.classify_topics, transcript)
-        speaker_analysis_task = asyncio.to_thread(report_generator.analyze_by_speaker, transcript)
-        type_task = asyncio.to_thread(report_generator.classify_meeting_type, transcript)
-        speaker_summary_task = asyncio.to_thread(report_generator.summarize_by_speaker, transcript)
+    if transcript:
+        try:
+            print(f"[/upload_and_analyze] 모든 AI 분석 병렬 실행 시작...")
+            analysis_tasks = [ # 모든 분석 함수 호출 (후속 질문 포함)
+                asyncio.to_thread(report_generator.summarize, transcript),
+                asyncio.to_thread(report_generator.generate_meeting_notes, transcript),
+                asyncio.to_thread(report_generator.generate_action_items, transcript),
+                asyncio.to_thread(report_generator.analyze_sentiment, transcript),
+                asyncio.to_thread(report_generator.generate_follow_up_questions, transcript), # <<< 추가됨
+                asyncio.to_thread(report_generator.extract_keywords, transcript),
+                asyncio.to_thread(report_generator.classify_topics, transcript),
+                asyncio.to_thread(report_generator.analyze_by_speaker, transcript),
+                asyncio.to_thread(report_generator.classify_meeting_type, transcript),
+                asyncio.to_thread(report_generator.summarize_by_speaker, transcript),
+                asyncio.to_thread(report_generator.calculate_engagement_score, transcript),
+                asyncio.to_thread(report_generator.generate_improvement_suggestions, transcript)
+            ]
+            results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
 
-        results = await asyncio.gather(
-            summary_task, notes_task, action_task, sentiment_task, followup_task,
-            keywords_task, topics_task, speaker_analysis_task, type_task, speaker_summary_task
-        )
-        
-        ai_reports = {
-            'summary': results[0],
-            'meeting_notes': results[1],
-            'action_items': results[2],
-            'sentiment': results[3],
-            'follow_up_questions': results[4],
-            'keywords': results[5],
-            'topics': results[6],
-            'by_speaker': results[7],
-            'meeting_type': results[8],
-            'speaker_summary': results[9]
-        }
-    except Exception as e:
-        ai_reports_error = f"AI 요약 생성 실패: {str(e)}"
+            ai_reports = { # 결과 매핑 (인덱스 유지)
+                'summary': results[0] if not isinstance(results[0], Exception) else f"Error: {results[0]}",
+                'meeting_notes': results[1] if not isinstance(results[1], Exception) else f"Error: {results[1]}",
+                'action_items': results[2] if not isinstance(results[2], Exception) else f"Error: {results[2]}",
+                'sentiment': results[3] if not isinstance(results[3], Exception) else f"Error: {results[3]}",
+                'follow_up_questions': results[4] if not isinstance(results[4], Exception) else f"Error: {results[4]}", # <<< 추가됨
+                'keywords': results[5] if not isinstance(results[5], Exception) else f"Error: {results[5]}",
+                'topics': results[6] if not isinstance(results[6], Exception) else f"Error: {results[6]}",
+                'by_speaker': results[7] if not isinstance(results[7], Exception) else f"Error: {results[7]}",
+                'meeting_type': results[8] if not isinstance(results[8], Exception) else f"Error: {results[8]}",
+                'speaker_summary': results[9] if not isinstance(results[9], Exception) else f"Error: {results[9]}",
+                'engagement_score': results[10] if not isinstance(results[10], Exception) else f"Error: {results[10]}",
+                'improvement_suggestions': results[11] if not isinstance(results[11], Exception) else f"Error: {results[11]}"
+            }
+            print(f"[/upload_and_analyze] 모든 AI 분석 완료.")
+        except Exception as e:
+            ai_reports_error = f"AI 분석 중 오류 발생: {str(e)}"
+    else:
+        ai_reports_error = "대화록이 비어있어 AI 분석을 건너뛰었습니다."
+
 
     # 5. 통합 결과 반환
     response_data = {
@@ -891,31 +955,27 @@ async def semantic_search(request: SemanticSearchRequest):
     """
     [수정] 의미 기반 회의록 검색 (비차단)
     """
+    # (기존 코드와 동일 - 변경 없음)
     if not report_generator:
         raise HTTPException(status_code=500, detail="OpenAI API 키가 설정되지 않았습니다")
 
     try:
-        # [수정] 1. 검색 쿼리를 임베딩으로 변환 (비동기 스레드)
         query_embedding = await asyncio.to_thread(
             report_generator.generate_embedding,
             request.query
         )
-
-        # [수정] 2. 특정 사용자의 회의록 내에서만 검색 (파일 I/O이므로 비동기 스레드)
         results = await asyncio.to_thread(
             embedding_manager.search_similar_meetings,
-            user_id=request.userId, # [수정]
+            user_id=request.userId,
             query_embedding=query_embedding,
             top_k=request.top_k
         )
-
         return {
             "query": request.query,
             "userId": request.userId,
             "total_results": len(results),
             "results": results
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검색 실패: {str(e)}")
 
@@ -924,28 +984,27 @@ async def semantic_search(request: SemanticSearchRequest):
 # App 서버 연동 엔드포인트 (사용자 분리 적용)
 # ========================================
 
-@app.post("/ai/analyze", 
+@app.post("/ai/analyze",
           response_model=AiAnalyzeResponse,
-          status_code=200) 
+          status_code=200)
 async def request_ai_analysis(
-    request: AiAnalyzeRequest, # [수정] AiAnalyzeRequest에 userId, meetingTitle 포함됨
+    request: AiAnalyzeRequest,
     background_tasks: BackgroundTasks
 ):
     """
-    [수정] App 서버로부터 AI 분석을 요청받습니다. (API 3.2)
-    (전달받은 userId를 백그라운드 작업에 넘겨 사용자별 임베딩을 저장)
+    [수정] App 서버로부터 AI 분석을 요청받습니다. (API 3.2) + 추가 AI 기능 호출 + 후속 질문 추가
     """
     print(f"✅ AI 분석 요청 수신: {request.meetingId} (User: {request.userId})")
-    
-    # [수정] BackgroundTasks에 async 함수를 바로 등록
+
+    # BackgroundTasks에 수정된 background_analysis_task 등록
     background_tasks.add_task(
-        background_analysis_task, 
+        background_analysis_task, # 수정된 함수 사용
         request.meetingId,
         request.filePath,
-        request.userId, # [수정]
-        request.meetingTitle # [신규 추가] 백그라운드 작업으로 제목 전달
+        request.userId,
+        request.meetingTitle
     )
-    
+
     return AiAnalyzeResponse(status="processing")
 
 
@@ -967,51 +1026,46 @@ async def get_meeting_list(
     [수정] 특정 사용자의 저장된 회의록 목록을 페이지 단위로 조회합니다. (비차단)
     (API 3.4와 유사하나, 이 API는 AI 서버의 임베딩 파일 기준)
     """
+    # (기존 코드와 동일 - 변경 없음)
     try:
-        # [수정] 1. 특정 사용자의 임베딩 데이터 로드 (파일 I/O이므로 비동기 스레드)
         all_meetings_data = await asyncio.to_thread(
             embedding_manager.load_all_embeddings,
             userId
         )
-        
+
         enriched_meetings = []
         for meeting_data in all_meetings_data:
             meeting_id = meeting_data.get("meeting_id")
             if not meeting_id: continue
-            
-            # 2. 'createdAt', 'status' 필드 동적 추가
+
             user_dir = embedding_manager._get_user_embedding_dir(userId)
             file_path = user_dir / f"meeting_{meeting_id}.json"
             created_at_iso = datetime.now().isoformat()
-            
+
             if file_path.exists():
                 try:
-                    # (파일 stat 읽는 것은 빠르므로 동기 유지)
                     mtime = file_path.stat().st_mtime
                     created_at_iso = datetime.fromtimestamp(mtime).isoformat()
                 except Exception as e:
                     print(f"파일 시간 읽기 오류: {meeting_id} - {e}")
-            
-            # [신규] 저장된 화자 정보 로드
+
             saved_speakers = meeting_data.get("speakers", [])
-            
+
             enriched_meetings.append({
                 "meetingId": meeting_id,
                 "title": meeting_data.get("title", ""),
                 "summary": meeting_data.get("summary", ""),
-                "status": "COMPLETED", # [수정] 임베딩이 저장된 것은 'COMPLETED'로 간주
+                "status": "COMPLETED",
                 "createdAt": created_at_iso,
-                "speakers": saved_speakers # [신규 수정] 화자 정보 응답에 포함
+                "speakers": saved_speakers
             })
-        
-        # 3. 필터링 로직 (기존과 동일)
+
         filtered_meetings = enriched_meetings
         if keyword:
             kw = keyword.lower()
-            filtered_meetings = [m for m in filtered_meetings 
-                                 if kw in m['title'].lower() 
+            filtered_meetings = [m for m in filtered_meetings
+                                 if kw in m['title'].lower()
                                  or kw in m['summary'].lower()
-                                 # [신규] 화자 이름(name)으로도 검색
                                  or any(kw in (s.get('name') or '').lower() for s in m['speakers'])
                                 ]
         if title:
@@ -1019,13 +1073,10 @@ async def get_meeting_list(
         if summary:
             filtered_meetings = [m for m in filtered_meetings if summary.lower() in m['summary'].lower()]
         if status:
-            # [수정] 쿼리 파라미터(status)와 데이터(m['status'])를 모두 소문자(or 대문자)로 통일하여 비교
             filtered_meetings = [m for m in filtered_meetings if status.lower() == m['status'].lower()]
 
-        # 4. 정렬 (최신순)
         filtered_meetings.sort(key=lambda m: m['createdAt'], reverse=True)
 
-        # 5. 페이징
         total_items = len(filtered_meetings)
         total_pages = math.ceil(total_items / size)
         if page < 1: page = 1
@@ -1033,7 +1084,6 @@ async def get_meeting_list(
         end_index = start_index + size
         paginated_content = filtered_meetings[start_index:end_index]
 
-        # 6. 응답 모델로 반환
         return MeetingListResponse(
             content=paginated_content,
             page=page,
@@ -1050,32 +1100,27 @@ async def get_meeting_list(
 # 3.5 임베딩 동기화 API 엔드포인트 (사용자 분리 적용)
 # ========================================
 
-@app.post("/embeddings/upsert", 
+@app.post("/embeddings/upsert",
           response_model=EmbeddingSyncResponse,
           status_code=status.HTTP_201_CREATED)
-async def upsert_embedding(request: EmbeddingUpsertRequest): # [수정] request에 speakers 포함
+async def upsert_embedding(request: EmbeddingUpsertRequest):
     """
     [수정] 임베딩 생성 또는 수정 (Upsert) (비차단)
-    (API 3.6 - 회의록 수정 시 App 서버가 이 API를 호출)
-    (App 서버가 보낸 'speakers' 객체에서 name을 추출하여 저장)
     """
+    # (기존 코드와 동일 - 변경 없음)
     print(f"🔄 [SYNC] 임베딩 Upsert 요청: {request.meetingId} (User: {request.userId})")
-    
+
     if not report_generator:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="OpenAI API 키가 설정되지 않아 임베딩을 생성할 수 없습니다.")
-    
+
     try:
-        # [수정] 1. App 서버가 보낸 최신 요약문으로 임베딩 생성 (비동기 스레드)
         print(f"  - 1/2. 임베딩 생성 중...")
         embedding_vector = await asyncio.to_thread(
             report_generator.generate_embedding,
             request.summary
         )
-        
-        # [신규] App 서버가 보낸 'speakers' 목록에서 
-        # 'speakerId'와 'name'만 추출하여 저장할 데이터를 만듭니다.
-        # (segments는 임베딩 파일에 저장할 필요가 없음)
+
         speaker_data_to_save = []
         if request.speakers:
             for speaker in request.speakers:
@@ -1083,20 +1128,19 @@ async def upsert_embedding(request: EmbeddingUpsertRequest): # [수정] request�
                     "speakerId": speaker.speakerId,
                     "name": speaker.name
                 })
-        
-        # [수정] 2. 사용자별 경로에 저장 (파일 I/O 비동기 스레드)
+
         print(f"  - 2/2. 임베딩 파일 저장 중 (화자 {len(speaker_data_to_save)}명 정보 포함)...")
         await asyncio.to_thread(
             embedding_manager.save_meeting_embedding,
-            user_id=request.userId, # [수정]
+            user_id=request.userId,
             meeting_id=request.meetingId,
-            title=request.title, # [수정] App 서버가 보낸 수정된 제목 사용
+            title=request.title,
             summary=request.summary,
             embedding=embedding_vector,
-            keywords=request.keywords, # [신규] App 서버가 보낸 키워드 저장
-            speakers=speaker_data_to_save # [신규 수정] 'speakerId'와 'name'만 추출한 데이터
+            keywords=request.keywords,
+            speakers=speaker_data_to_save
         )
-        
+
         print(f"  - ✅ [SYNC] Upsert 완료: {request.meetingId}")
         return EmbeddingSyncResponse(
             meetingId=request.meetingId,
@@ -1113,27 +1157,26 @@ async def upsert_embedding(request: EmbeddingUpsertRequest): # [수정] request�
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"임베딩 저장 실패: {e}")
 
 
-@app.delete("/embeddings/{meeting_id}", 
+@app.delete("/embeddings/{meeting_id}",
             response_model=EmbeddingSyncResponse,
             status_code=status.HTTP_200_OK)
 async def delete_embedding(
     meeting_id: str,
-    userId: str = Query(..., description="삭제할 사용자의 ID") # [수정] 쿼리 파라미터로 받음
+    userId: str = Query(..., description="삭제할 사용자의 ID")
 ):
     """
     [수정] 임베딩 삭제 (비차단)
-    (API 3.7 - 회의록 삭제 시 App 서버가 이 API를 호출)
     """
+    # (기존 코드와 동일 - 변경 없음)
     print(f"🗑️ [SYNC] 임베딩 Delete 요청: {meeting_id} (User: {userId})")
-    
+
     try:
-        # [수정] 사용자별로 삭제 (파일 I/O 비동기 스레드)
         success = await asyncio.to_thread(
             embedding_manager.delete_meeting_embedding,
-            userId, 
+            userId,
             meeting_id
         )
-        
+
         if success:
             print(f"  - ✅ [SYNC] Delete 완료: {meeting_id}")
             return EmbeddingSyncResponse(
@@ -1144,9 +1187,9 @@ async def delete_embedding(
             )
         else:
             print(f"  - ⚠️ [SYNC] Delete 실패 (파일 없음): {meeting_id}")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, 
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                                 detail="삭제할 임베딩 파일을 찾을 수 없습니다.")
-                                
+
     except Exception as e:
         print(f"  - ❌ [SYNC] Delete 실패 (서버 오류): {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"임베딩 삭제 실패: {e}")
@@ -1154,13 +1197,13 @@ async def delete_embedding(
 
 @app.get("/embeddings/status", status_code=status.HTTP_200_OK)
 async def get_embedding_stats(
-    userId: Optional[str] = Query(None, description="통계를 조회할 사용자 ID (없으면 전역)") # [수정]
+    userId: Optional[str] = Query(None, description="통계를 조회할 사용자 ID (없으면 전역)")
 ):
     """
     [수정] 현재 저장된 임베딩 통계 조회 (디버깅용, 비차단)
     """
+    # (기존 코드와 동일 - 변경 없음)
     try:
-        # [수정] 사용자별 또는 전역 통계 (파일 I/O 비동기 스레드)
         stats = await asyncio.to_thread(
             embedding_manager.get_stats,
             userId
@@ -1173,4 +1216,7 @@ async def get_embedding_stats(
 
 if __name__ == "__main__":
     import uvicorn
+    # 로그 레벨을 DEBUG로 설정하여 상세 정보 확인 가능
+    # uvicorn.run(app, host="0.0.0.0", port=8000, log_level="debug")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
