@@ -4,6 +4,7 @@
 [신규] /embeddings/** 백엔드 DB - AI 서버 임베딩 동기화 엔드포인트 추가
 [수정] 2024-10-23: 모든 데이터 처리에 userId 적용 (사용자별 데이터 분리)
 [수정] 2025-10-27: background_analysis_task에 추가 AI 기능(액션 아이템, 회의록, 감정 분석, 주제 분류, 후속 질문) 호출 추가
+[수정] 2025-10-28: Java DTO 파싱 로직 추가 및 콜백 데이터 구조 중첩
 """
 
 import os
@@ -12,6 +13,7 @@ import asyncio
 import requests # [유지] 동기 클라이언트를 위해
 import httpx    # [신규] 비동기 콜백을 위해
 import math
+import re       # [신규] Java DTO 파싱을 위해 re(정규식) import
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
@@ -21,7 +23,7 @@ from fastapi import (
     Depends, Form, status, Query
 )
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl, Field # [수정] Field 추가
+from pydantic import BaseModel, HttpUrl, Field
 
 from dotenv import load_dotenv
 
@@ -42,7 +44,6 @@ from src.core.formatter import (
     extract_speaker_statistics,
     generate_meeting_summary_header
 )
-# [수정] LangChain 버전의 ReportGenerator import 확인
 from src.core.ai_analyzer import ReportGenerator, ReportGeneratorError
 from src.core.embedding_manager import EmbeddingManager
 
@@ -57,7 +58,7 @@ load_dotenv()
 app = FastAPI(
     title="CLOVA Speech STT API",
     description="NAVER Cloud Platform CLOVA Speech API 서버 (사용자별 데이터 분리 적용)",
-    version="2.2.0" # [수정] 버전 업데이트 (후속 질문 추가)
+    version="2.3.0" # [수정] 버전 업데이트 (Java DTO 파싱)
 )
 
 # 글로벌 설정
@@ -240,7 +241,7 @@ async def root():
     """루트 엔드포인트"""
     return {
         "service": "CLOVA Speech STT API",
-        "version": "2.2.0", # [수정] 버전 업데이트
+        "version": "2.3.0", # [수정] 버전 업데이트
         "endpoints": [
             "/stt/url",
             "/stt/file",
@@ -250,12 +251,12 @@ async def root():
             "/transcript/summarize",
             "/transcript/statistics",
             "/upload_and_analyze",
-            "[User] /ai/analyze", # [수정]
-            "[User] /meetings",   # [수정]
-            "[User] /search/semantic",  # [수정]
-            "[SYNC] /embeddings/upsert", # [수정]
-            "[SYNC] /embeddings/{meeting_id}?userId=...", # [수정]
-            "[SYNC] /embeddings/status?userId=...", # [수정]
+            "[User] /ai/analyze",
+            "[User] /meetings",
+            "[User] /search/semantic",
+            "[SYNC] /embeddings/upsert",
+            "[SYNC] /embeddings/{meeting_id}?userId=...",
+            "[SYNC] /embeddings/status?userId=...",
         ]
     }
 
@@ -264,6 +265,147 @@ async def root():
 async def health():
     """헬스체크"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+# ========================================
+# [신규] Java DTO 파싱 헬퍼 함수 3개
+# ========================================
+
+def _parse_action_items(text: str) -> List[Dict[str, Any]]:
+    """
+    Java DTO의 List<ActionItem> 형식에 맞게 AI 텍스트를 파싱합니다.
+    예상 입력:
+        [담당자1] 작업내용1
+        - [담당자2] 작업내용2
+    """
+    items = []
+    if not text:
+        return items
+
+    # 정규식: "[담당자] 작업내용" 또는 "- [담당자] 작업내용"
+    # 그룹 1: 담당자 (name)
+    # 그룹 2: 작업내용 (content)
+    pattern = re.compile(r"^\s*[\-•*]?\s*\[([^\]]+)\]\s*(.*)", re.MULTILINE)
+    
+    for i, match in enumerate(pattern.finditer(text)):
+        name = match.group(1).strip()
+        content = match.group(2).strip()
+        
+        if not name or not content:
+            continue
+            
+        items.append({
+            "name": name,
+            "content": content,
+            "orderIndex": i
+        })
+    
+    # 정규식으로 파싱이 안 된 경우 (예: " - 작업내용 (담당: 없음)")
+    if not items and text.strip():
+        for i, line in enumerate(text.strip().split('\n')):
+            line = line.strip().lstrip('-•* ')
+            if not line:
+                continue
+            items.append({
+                "name": "미지정", # 기본값
+                "content": line,
+                "orderIndex": i
+            })
+            
+    return items
+
+def _parse_topics(text: str) -> List[Dict[str, Any]]:
+    """
+    Java DTO의 List<Topic> 형식에 맞게 AI 텍스트를 파싱합니다.
+    예상 입력:
+        **주요 주제 분류**:
+        1. [주제명] (중요도: 높음)
+           - 논의 내용 요약
+           - 전체 대화에서 차지하는 비중: 30%
+        
+        **주제 간 연관관계**:
+        ...
+    """
+    topics = []
+    if not text:
+        return topics
+        
+    # **주요 주제 분류** 섹션만 추출
+    section_match = re.search(r"\*\*주요 주제 분류\*\*([\s\S]*?)(\*\*|$)", text, re.MULTILINE)
+    if not section_match:
+        return topics
+        
+    section_text = section_match.group(1)
+
+    # 개별 Topic 항목 파싱
+    # 그룹 1: 주제명 (title)
+    # 그룹 2: 중요도 (importance)
+    # 그룹 3: 요약 (summary) - 비중 라인 전까지
+    # 그룹 4: 비중 (proportion)
+    pattern = re.compile(
+        r"^\s*\d+\.\s*\[([^\]]+)\]\s*\(중요도:\s*([^\)]+)\)\s*([\s\S]*?)\s*-\s*전체\s*대화에서\s*차지하는\s*비중:\s*(\d+)\s*%",
+        re.MULTILINE
+    )
+
+    for match in pattern.finditer(section_text):
+        title = match.group(1).strip()
+        importance = match.group(2).strip()
+        summary_raw = match.group(3).strip()
+        proportion_str = match.group(4).strip()
+        
+        # 요약 텍스트 정제 (앞뒤 공백, 불필요한 기호 제거)
+        summary = re.sub(r"^\s*-\s*논의\s*내용\s*요약\s*", "", summary_raw, flags=re.MULTILINE).strip().lstrip('-•* ')
+        
+        try:
+            proportion = int(proportion_str)
+        except ValueError:
+            proportion = 0
+            
+        topics.append({
+            "title": title,
+            "importance": importance,
+            "summary": summary,
+            "proportion": proportion
+        })
+        
+    return topics
+
+def _parse_follow_up_questions(text: str) -> List[Dict[str, Any]]:
+    """
+    Java DTO의 List<FollowUpCategory> 형식에 맞게 AI 텍스트를 파싱합니다.
+    AI가 카테고리 없이 질문 목록만 반환하므로, '주요 후속 질문' 단일 카테고리로 묶습니다.
+    
+    예상 입력:
+        - 후속 질문 1
+        - 후속 질문 2
+    """
+    questions = []
+    if not text:
+        return []
+
+    # 질문 목록 파싱
+    pattern = re.compile(r"^\s*[\-•*]\s*(.*)", re.MULTILINE)
+    
+    for i, match in enumerate(pattern.finditer(text)):
+        question_text = match.group(1).strip().strip('?') + '?'
+        if not question_text:
+            continue
+            
+        questions.append({
+            "question": question_text,
+            "orderIndex": i
+        })
+        
+    if not questions:
+        return []
+
+    # Java DTO 구조에 맞게 단일 카테고리로 래핑
+    default_category = {
+        "category": "주요 후속 질문", # DTO의 FollowUpCategory.category
+        "questions": questions      # DTO의 FollowUpCategory.questions
+    }
+    
+    return [default_category]
 
 
 # ========================================
@@ -303,11 +445,10 @@ def format_clova_to_app_speakers(segments: list) -> list:
     return list(speakers_dict.values())
 
 
-# [수정] 비동기 작업으로 변경 (async def) + 추가 AI 기능 호출 + 후속 질문 추가
+# [수정] 비동기 작업 + Java DTO 파싱 및 데이터 중첩
 async def background_analysis_task(meeting_id: str, file_path: str, user_id: str, meeting_title: Optional[str] = None):
     """
-    [수정] 비동기 백그라운드 분석 작업 + 추가 AI 기능 호출 + 후속 질문 추가
-    (동기(차단) 함수들을 asyncio.to_thread로 실행하여 메인 루프 멈춤 방지)
+    [수정] 비동기 백그라운드 분석 작업 + Java DTO 파싱 및 데이터 중첩
     """
     print(f"[Task {meeting_id}] AI 분석 작업 시작 (User: {user_id}): {file_path}")
 
@@ -317,12 +458,15 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
         "summary": None,
         "keywords": [],
         "speakers": [],
-        # --- [신규] 추가될 필드들 ---
-        "actionItems": None,
+        # --- [신규] Java DTO 구조에 맞춘 'feedback' 필드 ---
+        "feedback": {
+            "actionItems": [],
+            "topics": [],
+            "followUpCategories": []
+        },
+        # --- [유지] DTO에 없는 추가 분석 결과 (최상위) ---
         "meetingNotes": None,
         "sentiment": None,
-        "topics": None,
-        "followUpQuestions": None, # <<< [신규] 후속 질문 필드 추가
         # ---------------------------
         "error": None
     }
@@ -399,15 +543,18 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
             # ----------------------------------
 
             # 병렬 실행 (결과는 순서대로 리스트에 담김)
-            print(f"[Task {meeting_id}] 3h. AI 분석 병렬 실행...") # <<< 인덱스 수정
+            print(f"[Task {meeting_id}] 3h. AI 분석 병렬 실행...")
             results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
 
-            # 결과 매핑 (오류 발생 시 None 또는 기본값 할당)
+            # --- [수정] 결과 매핑 및 파싱 ---
+            
+            # 3-1. (최상위) 요약 (Summary)
             if isinstance(results[0], Exception):
                 print(f"[Task {meeting_id}] ⚠️ 요약 생성 실패: {results[0]}")
             else:
                 callback_data["summary"] = results[0]
 
+            # 3-2. (최상위) 키워드 (Keywords)
             if isinstance(results[1], Exception):
                 print(f"[Task {meeting_id}] ⚠️ 키워드 추출 실패: {results[1]}")
             else:
@@ -422,34 +569,41 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
                 unique_keywords = list(dict.fromkeys(filtered_keywords))
                 callback_data["keywords"] = unique_keywords[:10]
 
-            # --- [신규] 결과 매핑 ---
+            # 3-3. (Feedback) 액션 아이템 (ActionItems)
             if isinstance(results[2], Exception):
                 print(f"[Task {meeting_id}] ⚠️ 액션 아이템 추출 실패: {results[2]}")
             else:
-                callback_data["actionItems"] = results[2]
+                print(f"[Task {meeting_id}] 🌀 (파싱) 액션 아이템 파싱 시도...")
+                callback_data["feedback"]["actionItems"] = _parse_action_items(results[2])
 
+            # 3-4. (최상위) 회의록 (MeetingNotes)
             if isinstance(results[3], Exception):
                 print(f"[Task {meeting_id}] ⚠️ 회의록 생성 실패: {results[3]}")
             else:
                 callback_data["meetingNotes"] = results[3]
 
+            # 3-5. (최상위) 감정 분석 (Sentiment)
             if isinstance(results[4], Exception):
                 print(f"[Task {meeting_id}] ⚠️ 감정 분석 실패: {results[4]}")
             else:
                 callback_data["sentiment"] = results[4]
 
+            # 3-6. (Feedback) 주제 분류 (Topics)
             if isinstance(results[5], Exception):
                 print(f"[Task {meeting_id}] ⚠️ 주제 분류 실패: {results[5]}")
             else:
-                callback_data["topics"] = results[5]
+                print(f"[Task {meeting_id}] 🌀 (파싱) 주제 분류 파싱 시도...")
+                callback_data["feedback"]["topics"] = _parse_topics(results[5])
 
-            # --- <<< [신규] 후속 질문 결과 매핑 ---
-            if isinstance(results[6], Exception): # <<< 인덱스 수정
-                print(f"[Task {meeting_id}] ⚠️ 후속 질문 생성 실패: {results[6]}") # <<< 인덱스 수정
+            # 3-7. (Feedback) 후속 질문 (FollowUpQuestions)
+            if isinstance(results[6], Exception): 
+                print(f"[Task {meeting_id}] ⚠️ 후속 질문 생성 실패: {results[6]}") 
             else:
-                callback_data["followUpQuestions"] = results[6] # <<< 인덱스 수정, 백엔드 DTO 필드명과 일치 필요
-            # -----------------------------------
-
+                print(f"[Task {meeting_id}] 🌀 (파싱) 후속 질문 파싱 시도...")
+                callback_data["feedback"]["followUpCategories"] = _parse_follow_up_questions(results[6])
+            
+            # --- [파싱 완료] ---
+            
             # 5. 임베딩 저장 (요약이 성공했을 경우에만 시도)
             if callback_data["summary"]:
                 try:
@@ -499,6 +653,7 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
         try:
             async with httpx.AsyncClient() as async_client:
                 print(f"[Task {meeting_id}] 6. App 서버로 콜백 전송: {callback_url}")
+                # print(f"[DEBUG] 콜백 데이터: {json.dumps(callback_data, indent=2, ensure_ascii=False)}") # 디버깅용
                 response = await async_client.post(callback_url, json=callback_data, timeout=15)
                 response.raise_for_status()
                 print(f"[Task {meeting_id}] 7. 콜백 전송 성공 (App 서버 응답: {response.status_code})")
@@ -657,7 +812,7 @@ async def poll_result(job_id: str):
 async def startup():
     """서버 시작 시 실행 (DB 초기화 제거)"""
     # (기존 코드와 동일 - 변경 없음)
-    print(f"CLOVA Speech STT API server started (v{app.version} - User-Specific + Extra AI + Follow-up Qs)") # <<< 버전 로그 수정
+    print(f"CLOVA Speech STT API server started (v{app.version} - Java DTO Parsing)") # <<< 버전 로그 수정
     print(f"Invoke URL: {INVOKE_URL}")
     if APP_SERVER_CALLBACK_HOST:
         print(f"[CALLBACK] App Server Host: {APP_SERVER_CALLBACK_HOST}")
@@ -1219,4 +1374,3 @@ if __name__ == "__main__":
     # 로그 레벨을 DEBUG로 설정하여 상세 정보 확인 가능
     # uvicorn.run(app, host="0.0.0.0", port=8000, log_level="debug")
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
