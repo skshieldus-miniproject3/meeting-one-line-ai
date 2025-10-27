@@ -317,24 +317,38 @@ def _parse_action_items(text: str) -> List[Dict[str, Any]]:
 
 def _parse_topics(text: str) -> List[Dict[str, Any]]:
     """
-    Java DTO의 List<Topic> 형식에 맞게 AI 텍스트를 파싱합니다.
-    예상 입력:
-        **주요 주제 분류**:
-        1. [주제명] (중요도: 높음)
-           - 논의 내용 요약
-           - 전체 대화에서 차지하는 비중: 30%
-
-        **주제 간 연관관계**:
-        ...
+    [수정] Java DTO의 List<Topic> 형식에 맞게 AI 텍스트를 파싱합니다.
+    (AI가 복잡한 형식을 따르지 않는 경우를 대비한 단순화 버전)
     """
     topics = []
     if not text:
         return topics
 
-    # **주요 주제 분류** 섹션만 추출
-    section_match = re.search(r"\*\*주요 주제 분류\*\*([\s\S]*?)(\*\*|$)", text, re.MULTILINE)
-    if not section_match:
-        return topics
+    # **주요 주제 분류** 섹션이 있다면 그 아랫부분만 사용
+    section_text = text
+    section_match = re.search(r"\*\*주요 주제 분류\*\*([\s\S]*)", text, re.MULTILINE | re.IGNORECASE)
+    if section_match:
+        section_text = section_match.group(1)
+
+    # 정규식: (-, *, •, 1.) 등으로 시작하는 목록 항목
+    # 그룹 1: 주제명 (title)
+    pattern = re.compile(r"^\s*[\-•*]?\s*\d*\.?\s*\[?([^\]\n:]+)\]?", re.MULTILINE)
+
+    for match in pattern.finditer(section_text):
+        title = match.group(1).strip()
+        
+        # 너무 짧거나 불필요한 단어/헤더 필터링
+        if not title or len(title) < 3 or title.lower().startswith("중요도") or title.lower().startswith("논의 내용 요약") or title.lower().startswith("전체 대화에서"):
+            continue
+
+        topics.append({
+            "title": title,
+            "importance": "중간", # AI가 생성하지 않으므로 기본값
+            "summary": f"{title} 관련 논의", # AI가 생성하지 않으므로 기본값
+            "proportion": 0 # AI가 생성하지 않으므로 기본값
+        })
+    
+    return topics
 
     section_text = section_match.group(1)
 
@@ -1396,3 +1410,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
