@@ -5,6 +5,7 @@
 [수정] 2024-10-23: 모든 데이터 처리에 userId 적용 (사용자별 데이터 분리)
 [수정] 2025-10-27: background_analysis_task에 추가 AI 기능(액션 아이템, 회의록, 감정 분석, 주제 분류, 후속 질문) 호출 추가
 [수정] 2025-10-28: Java DTO 파싱 로직 추가 및 콜백 데이터 구조 중첩
+[수정] 2025-10-27 (재요청 반영): background_analysis_task에서 meetingTitle 파라미터 받아서 사용하도록 수정
 """
 
 import os
@@ -16,7 +17,7 @@ import math
 import re       # [신규] Java DTO 파싱을 위해 re(정규식) import
 from datetime import datetime
 from typing import Dict, Any, Optional, List
-from pathlib import Path
+from pathlib import Path # <<< Path 객체 사용 위해 추가
 
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException, BackgroundTasks,
@@ -34,7 +35,7 @@ from dotenv import load_dotenv
 
 # Add src to path for imports
 import sys
-from pathlib import Path
+# from pathlib import Path # <<< 위에서 import 했으므로 중복 제거
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from src.core.stt_client import ClovaSpeechClient, ClovaSpeechError
@@ -58,7 +59,7 @@ load_dotenv()
 app = FastAPI(
     title="CLOVA Speech STT API",
     description="NAVER Cloud Platform CLOVA Speech API 서버 (사용자별 데이터 분리 적용)",
-    version="2.3.0" # [수정] 버전 업데이트 (Java DTO 파싱)
+    version="2.3.1" # [수정] 버전 업데이트 (meetingTitle 반영)
 )
 
 # 글로벌 설정
@@ -155,12 +156,12 @@ class JobResponse(BaseModel):
 class AiAnalyzeRequest(BaseModel):
     """
     [수정] AI 분석 요청 모델 (App Server -> AI Server)
-    API 문서 3.2 기반 + userId 추가
+    API 문서 3.2 기반 + userId 추가 + meetingTitle 추가
     """
     meetingId: str
     filePath: str # 예: /data/uploads/meeting_123.wav
     userId: str   # [신규] App 서버가 인증을 통해 알아낸 사용자 ID
-    meetingTitle: Optional[str] = None # [신규 추가] 사용자가 입력한 원본 제목
+    meetingTitle: Optional[str] = None # <<< [신규 추가] 사용자가 입력한 원본 제목
 
 class AiAnalyzeResponse(BaseModel):
     """AI 분석 요청 즉시 응답 모델"""
@@ -241,7 +242,7 @@ async def root():
     """루트 엔드포인트"""
     return {
         "service": "CLOVA Speech STT API",
-        "version": "2.3.0", # [수정] 버전 업데이트
+        "version": "2.3.1", # [수정] 버전 업데이트
         "endpoints": [
             "/stt/url",
             "/stt/file",
@@ -286,20 +287,20 @@ def _parse_action_items(text: str) -> List[Dict[str, Any]]:
     # 그룹 1: 담당자 (name)
     # 그룹 2: 작업내용 (content)
     pattern = re.compile(r"^\s*[\-•*]?\s*\[([^\]]+)\]\s*(.*)", re.MULTILINE)
-    
+
     for i, match in enumerate(pattern.finditer(text)):
         name = match.group(1).strip()
         content = match.group(2).strip()
-        
+
         if not name or not content:
             continue
-            
+
         items.append({
             "name": name,
             "content": content,
             "orderIndex": i
         })
-    
+
     # 정규식으로 파싱이 안 된 경우 (예: " - 작업내용 (담당: 없음)")
     if not items and text.strip():
         for i, line in enumerate(text.strip().split('\n')):
@@ -311,7 +312,7 @@ def _parse_action_items(text: str) -> List[Dict[str, Any]]:
                 "content": line,
                 "orderIndex": i
             })
-            
+
     return items
 
 def _parse_topics(text: str) -> List[Dict[str, Any]]:
@@ -322,19 +323,19 @@ def _parse_topics(text: str) -> List[Dict[str, Any]]:
         1. [주제명] (중요도: 높음)
            - 논의 내용 요약
            - 전체 대화에서 차지하는 비중: 30%
-        
+
         **주제 간 연관관계**:
         ...
     """
     topics = []
     if not text:
         return topics
-        
+
     # **주요 주제 분류** 섹션만 추출
     section_match = re.search(r"\*\*주요 주제 분류\*\*([\s\S]*?)(\*\*|$)", text, re.MULTILINE)
     if not section_match:
         return topics
-        
+
     section_text = section_match.group(1)
 
     # 개별 Topic 항목 파싱
@@ -352,29 +353,29 @@ def _parse_topics(text: str) -> List[Dict[str, Any]]:
         importance = match.group(2).strip()
         summary_raw = match.group(3).strip()
         proportion_str = match.group(4).strip()
-        
+
         # 요약 텍스트 정제 (앞뒤 공백, 불필요한 기호 제거)
         summary = re.sub(r"^\s*-\s*논의\s*내용\s*요약\s*", "", summary_raw, flags=re.MULTILINE).strip().lstrip('-•* ')
-        
+
         try:
             proportion = int(proportion_str)
         except ValueError:
             proportion = 0
-            
+
         topics.append({
             "title": title,
             "importance": importance,
             "summary": summary,
             "proportion": proportion
         })
-        
+
     return topics
 
 def _parse_follow_up_questions(text: str) -> List[Dict[str, Any]]:
     """
     Java DTO의 List<FollowUpCategory> 형식에 맞게 AI 텍스트를 파싱합니다.
     AI가 카테고리 없이 질문 목록만 반환하므로, '주요 후속 질문' 단일 카테고리로 묶습니다.
-    
+
     예상 입력:
         - 후속 질문 1
         - 후속 질문 2
@@ -385,17 +386,17 @@ def _parse_follow_up_questions(text: str) -> List[Dict[str, Any]]:
 
     # 질문 목록 파싱
     pattern = re.compile(r"^\s*[\-•*]\s*(.*)", re.MULTILINE)
-    
+
     for i, match in enumerate(pattern.finditer(text)):
         question_text = match.group(1).strip().strip('?') + '?'
         if not question_text:
             continue
-            
+
         questions.append({
             "question": question_text,
             "orderIndex": i
         })
-        
+
     if not questions:
         return []
 
@@ -404,7 +405,7 @@ def _parse_follow_up_questions(text: str) -> List[Dict[str, Any]]:
         "category": "주요 후속 질문", # DTO의 FollowUpCategory.category
         "questions": questions      # DTO의 FollowUpCategory.questions
     }
-    
+
     return [default_category]
 
 
@@ -445,12 +446,17 @@ def format_clova_to_app_speakers(segments: list) -> list:
     return list(speakers_dict.values())
 
 
-# [수정] 비동기 작업 + Java DTO 파싱 및 데이터 중첩
-async def background_analysis_task(meeting_id: str, file_path: str, user_id: str, meeting_title: Optional[str] = None):
+# [수정] 비동기 작업 + Java DTO 파싱 및 데이터 중첩 + meetingTitle 사용
+async def background_analysis_task(meeting_id: str, file_path: str, user_id: str, meeting_title: Optional[str] = None): # <<< meeting_title 추가
     """
-    [수정] 비동기 백그라운드 분석 작업 + Java DTO 파싱 및 데이터 중첩
+    [수정] 비동기 백그라운드 분석 작업 + Java DTO 파싱 및 데이터 중첩 + meetingTitle 사용
     """
     print(f"[Task {meeting_id}] AI 분석 작업 시작 (User: {user_id}): {file_path}")
+    # [신규] 전달받은 제목 로그 추가
+    if meeting_title:
+        print(f"[Task {meeting_id}] 전달받은 회의 제목: {meeting_title}")
+    else:
+        print(f"[Task {meeting_id}] 전달받은 회의 제목 없음, 파일명 기반으로 생성 예정.")
 
     # App 서버로 전송할 콜백 데이터 (기본값 설정)
     callback_data = {
@@ -470,10 +476,11 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
         # ---------------------------
         "error": None
     }
+    segments = [] # <<< finally 블록에서 사용하기 위해 초기화
 
     try:
         # 0. 파일 경로 유효성 검사 (AI 서버 로컬 경로)
-        local_path = Path(file_path)
+        local_path = Path(file_path) # <<< Path 객체로 변환
         if not local_path.exists():
             raise FileNotFoundError(f"AI 서버에서 해당 파일을 찾을 수 없습니다: {file_path}")
 
@@ -486,12 +493,12 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
         }
         stt_result = await asyncio.to_thread(
             client.request_by_file,
-            local_path,
+            local_path, # <<< Path 객체 사용
             **stt_options
         )
         if 'segments' not in stt_result or not stt_result['segments']:
             raise ValueError("STT 실패: Clova 결과에 'segments'가 없습니다.")
-        segments = stt_result.get('segments', [])
+        segments = stt_result.get('segments', []) # <<< segments 변수 할당
         print(f"[Task {meeting_id}] 2. STT 완료 (세그먼트 {len(segments)}개)")
 
         # 2. 대화록(flat text) 변환 (AI 분석용)
@@ -500,8 +507,10 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
              print(f"[Task {meeting_id}] ⚠️ 대화록이 비어있어 AI 분석을 건너뜁니다.")
              callback_data["speakers"] = format_clova_to_app_speakers(segments)
              callback_data["status"] = "completed_no_transcript"
-             callback_data.pop("error")
-             return
+             if "error" in callback_data: callback_data.pop("error")
+             # <<< 여기서 return하지 않고 finally 블록에서 콜백 전송하도록 변경
+             # return # <<< 제거
+
 
         # 4. 화자 데이터 포맷팅 (App 서버 요구사항)
         print(f"[Task {meeting_id}] 4. 화자 데이터 포맷팅...")
@@ -513,8 +522,8 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
             for s in callback_data["speakers"]
         ]
 
-        # 3. AI 분석 (요약 + 키워드 + 추가 기능들 + 후속 질문)
-        if report_generator:
+        # 3. AI 분석 (요약 + 키워드 + 추가 기능들 + 후속 질문) - transcript가 있을 때만 실행
+        if transcript and report_generator:
             analysis_tasks = []
 
             # --- 기존 분석 ---
@@ -547,7 +556,7 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
             results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
 
             # --- [수정] 결과 매핑 및 파싱 ---
-            
+
             # 3-1. (최상위) 요약 (Summary)
             if isinstance(results[0], Exception):
                 print(f"[Task {meeting_id}] ⚠️ 요약 생성 실패: {results[0]}")
@@ -596,14 +605,14 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
                 callback_data["feedback"]["topics"] = _parse_topics(results[5])
 
             # 3-7. (Feedback) 후속 질문 (FollowUpQuestions)
-            if isinstance(results[6], Exception): 
-                print(f"[Task {meeting_id}] ⚠️ 후속 질문 생성 실패: {results[6]}") 
+            if isinstance(results[6], Exception):
+                print(f"[Task {meeting_id}] ⚠️ 후속 질문 생성 실패: {results[6]}")
             else:
                 print(f"[Task {meeting_id}] 🌀 (파싱) 후속 질문 파싱 시도...")
                 callback_data["feedback"]["followUpCategories"] = _parse_follow_up_questions(results[6])
-            
+
             # --- [파싱 완료] ---
-            
+
             # 5. 임베딩 저장 (요약이 성공했을 경우에만 시도)
             if callback_data["summary"]:
                 try:
@@ -612,14 +621,15 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
                         report_generator.generate_embedding,
                         callback_data["summary"]
                     )
-                    title_to_save = meeting_title if meeting_title else local_path.stem
+                    # <<< 제목 결정 로직 수정 >>>
+                    title_to_save = meeting_title if meeting_title else local_path.stem # <<< meeting_title 우선 사용
                     print(f"[Task {meeting_id}] 5. 저장될 제목: {title_to_save}")
 
                     await asyncio.to_thread(
                         embedding_manager.save_meeting_embedding,
                         user_id=user_id,
                         meeting_id=meeting_id,
-                        title=title_to_save,
+                        title=title_to_save, # <<< 수정된 제목 사용
                         summary=callback_data["summary"],
                         embedding=embedding_vector,
                         keywords=callback_data["keywords"],
@@ -631,36 +641,42 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
             else:
                  print(f"[Task {meeting_id}] ⚠️ 요약이 없어 임베딩 저장을 건너뜁니다.")
 
-
-        else:
+        elif not report_generator:
             print(f"[Task {meeting_id}] ⚠️ AI 분석기(ReportGenerator)가 없어 AI 분석을 건너뜁니다.")
 
-        callback_data["status"] = "completed"
-        callback_data.pop("error") # 성공 시 에러 필드 제거
+        # 대화록이 비어있지 않고 AI 분석까지 완료된 경우 또는 AI 분석기가 없는 경우 (STT는 성공)
+        if transcript and callback_data["status"] != "failed": # <<< 오류가 없을 때만 completed로 변경
+            callback_data["status"] = "completed"
+            if "error" in callback_data: callback_data.pop("error") # 성공 시 에러 필드 제거
 
     except Exception as e:
         print(f"[Task {meeting_id}] ❌ 분석 중 심각한 오류 발생: {e}")
+        callback_data["status"] = "failed" # 명시적으로 failed 설정
         callback_data["error"] = str(e)
-        # 상태는 'failed' 유지
+        # 필요한 경우, speakers 정보라도 채워넣기 (오류 발생 전에 segments가 생성되었다면)
+        if not callback_data["speakers"] and segments: # <<< 'segments in locals()' 제거
+            try:
+                callback_data["speakers"] = format_clova_to_app_speakers(segments)
+            except Exception as format_e:
+                 print(f"[Task {meeting_id}] ⚠️ 오류 발생 후 speakers 포맷팅 실패: {format_e}")
     finally:
         # 6. App 서버로 콜백 전송 (성공/실패/일부 성공 모두 전송 시도)
         if not APP_SERVER_CALLBACK_HOST:
             print(f"[Task {meeting_id}] ⚠️ .env에 APP_SERVER_CALLBACK_HOST가 설정되지 않아 콜백을 보낼 수 없습니다.")
-            return
-
-        callback_url = f"{APP_SERVER_CALLBACK_HOST}/api/meetings/{meeting_id}/callback"
-
-        try:
-            async with httpx.AsyncClient() as async_client:
-                print(f"[Task {meeting_id}] 6. App 서버로 콜백 전송: {callback_url}")
-                # print(f"[DEBUG] 콜백 데이터: {json.dumps(callback_data, indent=2, ensure_ascii=False)}") # 디버깅용
-                response = await async_client.post(callback_url, json=callback_data, timeout=15)
-                response.raise_for_status()
-                print(f"[Task {meeting_id}] 7. 콜백 전송 성공 (App 서버 응답: {response.status_code})")
-        except httpx.RequestError as e:
-            print(f"[Task {meeting_id}] ❌ 7. 콜백 전송 실패 (HTTPX 오류): {e}")
-        except Exception as e:
-            print(f"[Task {meeting_id}] ❌ 7. 콜백 전송 실패 (일반 오류): {e}")
+            # return # <<< 콜백 불가 시 여기서 종료하지 않음 (로깅은 남김)
+        else:
+            callback_url = f"{APP_SERVER_CALLBACK_HOST}/api/meetings/{meeting_id}/callback"
+            try:
+                async with httpx.AsyncClient() as async_client:
+                    print(f"[Task {meeting_id}] 6. App 서버로 콜백 전송: {callback_url}")
+                    # print(f"[DEBUG] 콜백 데이터: {json.dumps(callback_data, indent=2, ensure_ascii=False)}") # 디버깅용
+                    response = await async_client.post(callback_url, json=callback_data, timeout=30) # <<< 타임아웃 증가
+                    response.raise_for_status()
+                    print(f"[Task {meeting_id}] 7. 콜백 전송 성공 (App 서버 응답: {response.status_code})")
+            except httpx.RequestError as e:
+                print(f"[Task {meeting_id}] ❌ 7. 콜백 전송 실패 (HTTPX 오류): {e}")
+            except Exception as e:
+                print(f"[Task {meeting_id}] ❌ 7. 콜백 전송 실패 (일반 오류): {e}")
 
 
 # ========================================
@@ -750,7 +766,7 @@ async def transcribe_file(
         )
 
         if completion == 'sync':
-            temp_file.unlink(missing_ok=True)
+            # temp_file.unlink(missing_ok=True) # <<< finally에서 처리하므로 주석 처리
             return JSONResponse(content=result)
         else:
             job_id = result if isinstance(result, str) else str(uuid.uuid4())
@@ -767,7 +783,8 @@ async def transcribe_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"내부 서버 오류: {e}")
     finally:
-        if completion == 'sync' and temp_file and temp_file.exists():
+        # <<< finally 블록으로 파일 삭제 이동 (sync 모드에서도 오류 발생 시 삭제되도록)
+        if temp_file and temp_file.exists():
              temp_file.unlink(missing_ok=True)
 
 
@@ -789,6 +806,7 @@ async def get_job_status(job_id: str):
 async def poll_result(job_id: str):
     """[수정] 백그라운드에서 비동기 작업 결과 폴링 (비차단)"""
     # (기존 코드와 동일 - 변경 없음)
+    temp_file_path = None # <<< finally 블록에서 사용하기 위해 초기화
     try:
         result = await asyncio.to_thread(
             client.wait_for_completion,
@@ -802,7 +820,8 @@ async def poll_result(job_id: str):
         job_store[job_id]['status'] = 'failed'
         job_store[job_id]['error'] = str(e)
     finally:
-        if job_store[job_id]['type'] == 'file':
+        # <<< async 모드의 파일 삭제 로직
+        if job_id in job_store and job_store[job_id]['type'] == 'file':
             temp_file_path = job_store[job_id].get('temp_file')
             if temp_file_path and Path(temp_file_path).exists():
                 Path(temp_file_path).unlink(missing_ok=True)
@@ -812,7 +831,7 @@ async def poll_result(job_id: str):
 async def startup():
     """서버 시작 시 실행 (DB 초기화 제거)"""
     # (기존 코드와 동일 - 변경 없음)
-    print(f"CLOVA Speech STT API server started (v{app.version} - Java DTO Parsing)") # <<< 버전 로그 수정
+    print(f"CLOVA Speech STT API server started (v{app.version} - meetingTitle Added)") # <<< 버전 로그 수정
     print(f"Invoke URL: {INVOKE_URL}")
     if APP_SERVER_CALLBACK_HOST:
         print(f"[CALLBACK] App Server Host: {APP_SERVER_CALLBACK_HOST}")
@@ -1029,12 +1048,13 @@ async def upload_and_analyze(
         )
 
     except ClovaSpeechError as e:
-        if temp_file and temp_file.exists(): temp_file.unlink(missing_ok=True)
+        # if temp_file and temp_file.exists(): temp_file.unlink(missing_ok=True) # <<< finally에서 처리
         raise HTTPException(status_code=400, detail=f"STT 오류: {e}")
     except Exception as e:
-        if temp_file and temp_file.exists(): temp_file.unlink(missing_ok=True)
+        # if temp_file and temp_file.exists(): temp_file.unlink(missing_ok=True) # <<< finally에서 처리
         raise HTTPException(status_code=500, detail=f"파일 처리 또는 STT 오류: {e}")
     finally:
+        # <<< finally 블록으로 파일 삭제 이동
         if temp_file and temp_file.exists():
             temp_file.unlink(missing_ok=True)
 
@@ -1147,7 +1167,7 @@ async def request_ai_analysis(
     background_tasks: BackgroundTasks
 ):
     """
-    [수정] App 서버로부터 AI 분석을 요청받습니다. (API 3.2) + 추가 AI 기능 호출 + 후속 질문 추가
+    [수정] App 서버로부터 AI 분석을 요청받습니다. (API 3.2) + 추가 AI 기능 호출 + 후속 질문 추가 + meetingTitle 전달
     """
     print(f"✅ AI 분석 요청 수신: {request.meetingId} (User: {request.userId})")
 
@@ -1157,7 +1177,7 @@ async def request_ai_analysis(
         request.meetingId,
         request.filePath,
         request.userId,
-        request.meetingTitle
+        request.meetingTitle # <<< meetingTitle 전달
     )
 
     return AiAnalyzeResponse(status="processing")
@@ -1210,9 +1230,9 @@ async def get_meeting_list(
                 "meetingId": meeting_id,
                 "title": meeting_data.get("title", ""),
                 "summary": meeting_data.get("summary", ""),
-                "status": "COMPLETED",
+                "status": "COMPLETED", # 임베딩 파일은 항상 완료 상태
                 "createdAt": created_at_iso,
-                "speakers": saved_speakers
+                "speakers": saved_speakers # 저장된 화자 정보 사용
             })
 
         filtered_meetings = enriched_meetings
@@ -1228,12 +1248,15 @@ async def get_meeting_list(
         if summary:
             filtered_meetings = [m for m in filtered_meetings if summary.lower() in m['summary'].lower()]
         if status:
-            filtered_meetings = [m for m in filtered_meetings if status.lower() == m['status'].lower()]
+            # 임베딩은 항상 completed 상태이므로, 다른 상태 필터링 시 결과 없음
+            if status.lower() != "completed":
+                 filtered_meetings = []
+            # else: completed는 필터링 불필요
 
         filtered_meetings.sort(key=lambda m: m['createdAt'], reverse=True)
 
         total_items = len(filtered_meetings)
-        total_pages = math.ceil(total_items / size)
+        total_pages = math.ceil(total_items / size) if size > 0 else 0
         if page < 1: page = 1
         start_index = (page - 1) * size
         end_index = start_index + size
@@ -1242,7 +1265,7 @@ async def get_meeting_list(
         return MeetingListResponse(
             content=paginated_content,
             page=page,
-            size=size,
+            size=len(paginated_content), # 현재 페이지의 실제 아이템 수
             totalPages=total_pages
         )
 
@@ -1373,4 +1396,4 @@ if __name__ == "__main__":
     import uvicorn
     # 로그 레벨을 DEBUG로 설정하여 상세 정보 확인 가능
     # uvicorn.run(app, host="0.0.0.0", port=8000, log_level="debug")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True) # <<< reload=True 추가 (개발 편의성)
