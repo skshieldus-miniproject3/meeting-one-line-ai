@@ -1394,6 +1394,5 @@ async def get_embedding_stats(
 
 if __name__ == "__main__":
     import uvicorn
-    # 로그 레벨을 DEBUG로 설정하여 상세 정보 확인 가능
-    # uvicorn.run(app, host="0.0.0.0", port=8000, log_level="debug")
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True) # <<< reload=True 추가 (개발 편의성)
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
