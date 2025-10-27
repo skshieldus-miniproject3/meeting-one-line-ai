@@ -6,6 +6,9 @@
 [수정] 2025-10-27: background_analysis_task에 추가 AI 기능(액션 아이템, 회의록, 감정 분석, 주제 분류, 후속 질문) 호출 추가
 [수정] 2025-10-28: Java DTO 파싱 로직 추가 및 콜백 데이터 구조 중첩
 [수정] 2025-10-27 (재요청 반영): background_analysis_task에서 meetingTitle 파라미터 받아서 사용하도록 수정
+[수정] 2025-10-27 (경고 수정): on_event -> lifespan 방식으로 변경
+[수정] 2025-10-27 (버그 수정): _parse_topics 함수를 단순 목록도 파싱하도록 수정
+[수정] 2025-10-27 (버그 수정): AI 분석 완료 시 status가 'completed'로 정확히 설정되도록 로직 수정
 """
 
 import os
@@ -18,6 +21,7 @@ import re       # [신규] Java DTO 파싱을 위해 re(정규식) import
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path # <<< Path 객체 사용 위해 추가
+from contextlib import asynccontextmanager # <<< [신규] lifespan을 위해 추가
 
 from fastapi import (
     FastAPI, UploadFile, File, HTTPException, BackgroundTasks,
@@ -55,11 +59,40 @@ load_dotenv()
 # models.Base.metadata.create_all(bind=database.engine) # DB 테이블 생성 제거
 # -----------------------
 
-# FastAPI 앱 생성
+
+# <<< [신규] lifespan 함수 정의 >>>
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- 서버 시작 시 실행될 코드 (구 startup) ---
+    print(f"CLOVA Speech STT API server starting... (v{app.version} - Lifespan)")
+    print(f"Invoke URL: {INVOKE_URL}")
+    if APP_SERVER_CALLBACK_HOST:
+        print(f"[CALLBACK] App Server Host: {APP_SERVER_CALLBACK_HOST}")
+    else:
+        print("[CALLBACK] ⚠️ APP_SERVER_CALLBACK_HOST가 .env에 설정되지 않았습니다. /ai/analyze 콜백이 작동하지 않습니다.")
+    # --- startup 끝 ---
+    
+    yield # 이 지점에서 애플리케이션이 실행됩니다.
+    
+    # --- 서버 종료 시 실행될 코드 (구 shutdown) ---
+    print("Server shutting down...")
+    temp_dir = Path("temp")
+    if temp_dir.exists():
+        for temp_file in temp_dir.glob("*"):
+            temp_file.unlink(missing_ok=True)
+        try:
+            temp_dir.rmdir()
+        except OSError: pass
+    print("Cleanup completed")
+    # --- shutdown 끝 ---
+
+
+# FastAPI 앱 생성 (lifespan 적용)
 app = FastAPI(
     title="CLOVA Speech STT API",
-    description="NAVER Cloud Platform CLOVA Speech API 서버 (사용자별 데이터 분리 적용)",
-    version="2.3.1" # [수정] 버전 업데이트 (meetingTitle 반영)
+    description="NAVER Cloud Platform STT API 서버 (사용자별 데이터 분리 적용)",
+    version="2.3.3", # [수정] 버전 업데이트 (lifespan, topics_fix, status_fix)
+    lifespan=lifespan  # <<< [수정] lifespan 함수 연결
 )
 
 # 글로벌 설정
@@ -242,7 +275,7 @@ async def root():
     """루트 엔드포인트"""
     return {
         "service": "CLOVA Speech STT API",
-        "version": "2.3.1", # [수정] 버전 업데이트
+        "version": app.version, # <<< FastAPI 앱 버전 사용
         "endpoints": [
             "/stt/url",
             "/stt/file",
@@ -315,6 +348,7 @@ def _parse_action_items(text: str) -> List[Dict[str, Any]]:
 
     return items
 
+# <<< [수정] _parse_topics 함수를 단순화된 버전으로 교체 >>>
 def _parse_topics(text: str) -> List[Dict[str, Any]]:
     """
     [수정] Java DTO의 List<Topic> 형식에 맞게 AI 텍스트를 파싱합니다.
@@ -348,41 +382,6 @@ def _parse_topics(text: str) -> List[Dict[str, Any]]:
             "proportion": 0 # AI가 생성하지 않으므로 기본값
         })
     
-    return topics
-
-    section_text = section_match.group(1)
-
-    # 개별 Topic 항목 파싱
-    # 그룹 1: 주제명 (title)
-    # 그룹 2: 중요도 (importance)
-    # 그룹 3: 요약 (summary) - 비중 라인 전까지
-    # 그룹 4: 비중 (proportion)
-    pattern = re.compile(
-        r"^\s*\d+\.\s*\[([^\]]+)\]\s*\(중요도:\s*([^\)]+)\)\s*([\s\S]*?)\s*-\s*전체\s*대화에서\s*차지하는\s*비중:\s*(\d+)\s*%",
-        re.MULTILINE
-    )
-
-    for match in pattern.finditer(section_text):
-        title = match.group(1).strip()
-        importance = match.group(2).strip()
-        summary_raw = match.group(3).strip()
-        proportion_str = match.group(4).strip()
-
-        # 요약 텍스트 정제 (앞뒤 공백, 불필요한 기호 제거)
-        summary = re.sub(r"^\s*-\s*논의\s*내용\s*요약\s*", "", summary_raw, flags=re.MULTILINE).strip().lstrip('-•* ')
-
-        try:
-            proportion = int(proportion_str)
-        except ValueError:
-            proportion = 0
-
-        topics.append({
-            "title": title,
-            "importance": importance,
-            "summary": summary,
-            "proportion": proportion
-        })
-
     return topics
 
 def _parse_follow_up_questions(text: str) -> List[Dict[str, Any]]:
@@ -615,15 +614,27 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
             if isinstance(results[5], Exception):
                 print(f"[Task {meeting_id}] ⚠️ 주제 분류 실패: {results[5]}")
             else:
-                print(f"[Task {meeting_id}] 🌀 (파싱) 주제 분류 파싱 시도...")
-                callback_data["feedback"]["topics"] = _parse_topics(results[5])
+                # <<< 로그 추가 시작 >>>
+                ai_topics_output = results[5]
+                print(f"[Task {meeting_id}] 🌀 (파싱 전) AI Topics 출력:\n---\n{ai_topics_output}\n---")
+                print(f"[Task {meeting_id}] 🌀 (파싱 시도) 주제 분류 파싱 시도...")
+                callback_data["feedback"]["topics"] = _parse_topics(ai_topics_output) # <<< 수정된 _parse_topics 사용
+                print(f"[Task {meeting_id}] 🌀 (파싱 후) Topics 결과: {callback_data['feedback']['topics']}")
+                # <<< 로그 추가 끝 >>>
+
 
             # 3-7. (Feedback) 후속 질문 (FollowUpQuestions)
             if isinstance(results[6], Exception):
                 print(f"[Task {meeting_id}] ⚠️ 후속 질문 생성 실패: {results[6]}")
             else:
-                print(f"[Task {meeting_id}] 🌀 (파싱) 후속 질문 파싱 시도...")
-                callback_data["feedback"]["followUpCategories"] = _parse_follow_up_questions(results[6])
+                # <<< 로그 추가 시작 >>>
+                ai_followup_output = results[6]
+                print(f"[Task {meeting_id}] 🌀 (파싱 전) AI Follow-up 출력:\n---\n{ai_followup_output}\n---")
+                print(f"[Task {meeting_id}] 🌀 (파싱 시도) 후속 질문 파싱 시도...")
+                callback_data["feedback"]["followUpCategories"] = _parse_follow_up_questions(ai_followup_output)
+                print(f"[Task {meeting_id}] 🌀 (파싱 후) Follow-up 결과: {callback_data['feedback']['followUpCategories']}")
+                # <<< 로그 추가 끝 >>>
+
 
             # --- [파싱 완료] ---
 
@@ -651,17 +662,24 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
                     )
                     print(f"[Task {meeting_id}] 5. 임베딩 저장 완료: {meeting_id}")
                 except Exception as e:
-                    print(f"[Task {meeting_id}] ⚠️ 5. 임베딩 저장 실패: {e}")
+                    print(f"[Task {meeting_id}] ⚠️ 5. 임베딩 저장 실패: {e}") # <<< 임베딩 저장 실패는 경고로 처리
             else:
                  print(f"[Task {meeting_id}] ⚠️ 요약이 없어 임베딩 저장을 건너뜁니다.")
 
         elif not report_generator:
             print(f"[Task {meeting_id}] ⚠️ AI 분석기(ReportGenerator)가 없어 AI 분석을 건너뜁니다.")
 
-        # 대화록이 비어있지 않고 AI 분석까지 완료된 경우 또는 AI 분석기가 없는 경우 (STT는 성공)
-        if transcript and callback_data["status"] != "failed": # <<< 오류가 없을 때만 completed로 변경
+        # <<< [수정] status 'completed' 설정 로직 수정 >>>
+        # transcript(대화록)가 존재하고, 이전에 'completed_no_transcript'로 설정되지 않았다면
+        # (임베딩 저장 실패(⚠️)는 무시하고) 분석 작업은 완료된 것으로 간주합니다.
+        if transcript and callback_data["status"] != "completed_no_transcript":
             callback_data["status"] = "completed"
-            if "error" in callback_data: callback_data.pop("error") # 성공 시 에러 필드 제거
+            # 'failed'가 초기값이었을 수 있으므로 'error' 필드 제거
+            if "error" in callback_data:
+                callback_data.pop("error")
+        
+        # (transcript가 없는 경우는 이미 'completed_no_transcript'로 설정되었음)
+        # (만약 이전에 심각한 오류(❌)가 발생했다면 status는 'failed'로 유지됨)
 
     except Exception as e:
         print(f"[Task {meeting_id}] ❌ 분석 중 심각한 오류 발생: {e}")
@@ -683,6 +701,7 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
             try:
                 async with httpx.AsyncClient() as async_client:
                     print(f"[Task {meeting_id}] 6. App 서버로 콜백 전송: {callback_url}")
+                    # import json # <<< 디버깅 시 필요
                     # print(f"[DEBUG] 콜백 데이터: {json.dumps(callback_data, indent=2, ensure_ascii=False)}") # 디버깅용
                     response = await async_client.post(callback_url, json=callback_data, timeout=30) # <<< 타임아웃 증가
                     response.raise_for_status()
@@ -841,31 +860,8 @@ async def poll_result(job_id: str):
                 Path(temp_file_path).unlink(missing_ok=True)
 
 
-@app.on_event("startup")
-async def startup():
-    """서버 시작 시 실행 (DB 초기화 제거)"""
-    # (기존 코드와 동일 - 변경 없음)
-    print(f"CLOVA Speech STT API server started (v{app.version} - meetingTitle Added)") # <<< 버전 로그 수정
-    print(f"Invoke URL: {INVOKE_URL}")
-    if APP_SERVER_CALLBACK_HOST:
-        print(f"[CALLBACK] App Server Host: {APP_SERVER_CALLBACK_HOST}")
-    else:
-        print("[CALLBACK] ⚠️ APP_SERVER_CALLBACK_HOST가 .env에 설정되지 않았습니다. /ai/analyze 콜백이 작동하지 않습니다.")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    """서버 종료 시 정리 (DB 무관)"""
-    # (기존 코드와 동일 - 변경 없음)
-    print("Server shutting down...")
-    temp_dir = Path("temp")
-    if temp_dir.exists():
-        for temp_file in temp_dir.glob("*"):
-            temp_file.unlink(missing_ok=True)
-        try:
-            temp_dir.rmdir()
-        except OSError: pass
-    print("Cleanup completed")
+# <<< [삭제] @app.on_event("startup") 함수 삭제 >>>
+# <<< [삭제] @app.on_event("shutdown") 함수 삭제 >>>
 
 
 @app.post("/meeting/transcribe")
@@ -1408,6 +1404,7 @@ async def get_embedding_stats(
 
 if __name__ == "__main__":
     import uvicorn
-
+    # 로그 레벨을 DEBUG로 설정하여 상세 정보 확인 가능
+    # uvicorn.run(app, host="0.0.0.0", port=8000, log_level="debug")
+    # <<< [수정] reload=True 제거 (uvicorn server:app --reload 방식 권장) >>>
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
