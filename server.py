@@ -642,13 +642,25 @@ async def background_analysis_task(meeting_id: str, file_path: str, user_id: str
             if callback_data["summary"]:
                 try:
                     print(f"[Task {meeting_id}] 5. 임베딩 저장 시작 (User: {user_id})")
-                    embedding_vector = await asyncio.to_thread(
-                        report_generator.generate_embedding,
-                        callback_data["summary"]
-                    )
                     # <<< 제목 결정 로직 수정 >>>
                     title_to_save = meeting_title if meeting_title else local_path.stem # <<< meeting_title 우선 사용
                     print(f"[Task {meeting_id}] 5. 저장될 제목: {title_to_save}")
+
+                    # [개선] 검색 범위 확대: 제목, 요약, 키워드, 대화록을 결합하여 임베딩 생성
+                    searchable_text = f"""제목: {title_to_save}
+
+요약: {callback_data["summary"]}
+
+키워드: {', '.join(callback_data["keywords"]) if callback_data.get("keywords") else '없음'}
+
+대화록 (일부):
+{transcript[:2000] if transcript else '대화록 없음'}"""
+
+                    print(f"[Task {meeting_id}] 5. 임베딩 생성 중 (제목+요약+키워드+대화록 결합)")
+                    embedding_vector = await asyncio.to_thread(
+                        report_generator.generate_embedding,
+                        searchable_text
+                    )
 
                     await asyncio.to_thread(
                         embedding_manager.save_meeting_embedding,
@@ -1303,10 +1315,17 @@ async def upsert_embedding(request: EmbeddingUpsertRequest):
                             detail="OpenAI API 키가 설정되지 않아 임베딩을 생성할 수 없습니다.")
 
     try:
-        print(f"  - 1/2. 임베딩 생성 중...")
+        # [개선] 검색 범위 확대: 제목, 요약, 키워드를 결합하여 임베딩 생성
+        searchable_text = f"""제목: {request.title}
+
+요약: {request.summary}
+
+키워드: {', '.join(request.keywords) if request.keywords else '없음'}"""
+
+        print(f"  - 1/2. 임베딩 생성 중 (제목+요약+키워드 결합)...")
         embedding_vector = await asyncio.to_thread(
             report_generator.generate_embedding,
-            request.summary
+            searchable_text
         )
 
         speaker_data_to_save = []
