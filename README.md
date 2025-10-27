@@ -6,7 +6,8 @@ AI 기반 회의 전사 및 분석 애플리케이션
 
 - 🎯 **고정밀 음성 인식**: NAVER Cloud Platform CLOVA Speech 기반
 - 👥 **화자 분리**: 최대 10명까지 화자 자동 인식
-- 🧠 **AI 분석**: OpenAI GPT를 활용한 자동 요약 및 회의록 생성
+- 🧠 **AI 분석**: **LangChain + OpenAI GPT**를 활용한 자동 요약 및 회의록 생성
+- 🔗 **LangChain 통합**: ChatOpenAI, OpenAIEmbeddings 기반 고급 AI 기능
 - 📊 **통계 분석**: 화자별 발화 시간 및 참여도 분석
 - 🌐 **REST API**: FastAPI 기반 웹 서비스
 - 📝 **다양한 출력**: 텍스트, JSON, Markdown 형태로 결과 제공
@@ -21,9 +22,12 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1  # Windows
 # source .venv/bin/activate  # macOS/Linux
 
-# 의존성 설치
+# 의존성 설치 (LangChain 포함)
 pip install -r requirements.txt
 pip install -e .
+
+# LangChain 통합 테스트
+python test_langchain.py
 ```
 
 ### 2. API 키 설정
@@ -248,6 +252,50 @@ curl http://localhost:8000/health
 - 16kHz, 16-bit, Mono 형태의 WAV 파일 권장
 - 5분 이하 오디오 파일로 나누어 처리 권장
 - 대용량 파일은 비동기 모드 사용
+
+## 🆕 LangChain 통합
+
+**Meeting One Line AI는 이제 LangChain 기반으로 구동됩니다!**
+
+### 주요 변경사항
+
+- ✅ **ChatOpenAI**: LLM 호출을 위한 LangChain 래퍼 사용
+- ✅ **OpenAIEmbeddings**: 임베딩 생성을 위한 LangChain 래퍼 사용
+- ✅ **ChatPromptTemplate**: 체계적인 프롬프트 관리
+- ✅ **Chain 패턴**: `chat_prompt | llm` 파이프라인
+
+### 새로운 의존성
+
+```txt
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-community>=0.0.20
+```
+
+### 테스트
+
+```bash
+# LangChain 통합 테스트
+python test_langchain.py
+
+# 예상 출력:
+# ✅ Import 성공: ReportGenerator, ReportGeneratorError
+# ✅ ReportGenerator 초기화 성공
+# ✅ LLM은 ChatOpenAI 인스턴스입니다
+# ✅ Embeddings는 OpenAIEmbeddings 인스턴스입니다
+```
+
+### 자세한 내용
+
+LangChain 통합에 대한 자세한 정보는 [LANGCHAIN_INTEGRATION.md](./LANGCHAIN_INTEGRATION.md)를 참고하세요.
+
+### API 호환성
+
+**✅ 모든 기존 API 엔드포인트와 100% 호환됩니다.**
+
+Backend와 Frontend는 수정 없이 그대로 사용 가능합니다.
+
+---
 
 ## 📄 라이선스
 

@@ -1,9 +1,10 @@
-"""OpenAI를 이용한 회의록 요약 및 문서 생성"""
+"""LangChain을 이용한 회의록 요약 및 문서 생성"""
 
 import os
 import logging
 from typing import Optional
-from openai import OpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
 
 
 class ReportGeneratorError(Exception):
@@ -12,7 +13,7 @@ class ReportGeneratorError(Exception):
 
 
 class ReportGenerator:
-    """OpenAI LLM을 이용한 요약 및 문서 생성기"""
+    """LangChain을 이용한 요약 및 문서 생성기"""
 
     def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o-mini"):
         """
@@ -27,12 +28,21 @@ class ReportGenerator:
             raise ReportGeneratorError("OPENAI_API_KEY가 설정되지 않았습니다. .env 파일을 확인해주세요.")
 
         self.model = model
-        self.client = OpenAI(api_key=self.api_key)
+        self.llm = ChatOpenAI(
+            model=self.model,
+            api_key=self.api_key,
+            temperature=0.3,
+            max_tokens=4000
+        )
+        self.embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            api_key=self.api_key
+        )
         self.logger = logging.getLogger(__name__)
 
     def _call_llm(self, system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str:
         """
-        LLM 호출 공통 함수
+        LLM 호출 공통 함수 (LangChain 사용)
 
         Args:
             system_prompt: 시스템 프롬프트
@@ -46,27 +56,36 @@ class ReportGenerator:
             ReportGeneratorError: API 호출 실패 시
         """
         try:
-            response = self.client.chat.completions.create(
+            # ChatPromptTemplate 생성
+            chat_prompt = ChatPromptTemplate.from_messages([
+                ("system", system_prompt),
+                ("user", user_prompt)
+            ])
+
+            # temperature를 동적으로 설정하기 위해 새 LLM 인스턴스 생성
+            llm = ChatOpenAI(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
+                api_key=self.api_key,
                 temperature=temperature,
                 max_tokens=4000
             )
-            return response.choices[0].message.content.strip()
+
+            # LangChain invoke 패턴 사용
+            chain = chat_prompt | llm
+            response = chain.invoke({})
+
+            return response.content.strip()
         except Exception as e:
-            self.logger.error(f"OpenAI API 호출 오류: {e}")
+            self.logger.error(f"LangChain LLM 호출 오류: {e}")
             raise ReportGeneratorError(f"LLM 호출 중 오류가 발생했습니다: {e}")
 
     # --- [기존 5개 기능] ---
 
     def summarize(self, transcript: str) -> str:
         """
-        대화록 텍스트를 핵심 요약합니다. (기존 기능)
+        대화록 텍스트를 핵심 요약합니다. (LangChain 기반)
         """
-        self.logger.info("대화록 요약 생성 중...")
+        self.logger.info("대화록 요약 생성 중... (LangChain)")
 
         system_prompt = """당신은 회의록을 전문적으로 요약하는 어시스턴트입니다.
         다음 지침을 따라 요약해주세요:
@@ -89,9 +108,9 @@ class ReportGenerator:
 
     def generate_meeting_notes(self, transcript: str) -> str:
         """
-        대화록을 바탕으로 공식 회의록 문서를 생성합니다. (기존 기능)
+        대화록을 바탕으로 공식 회의록 문서를 생성합니다. (LangChain 기반)
         """
-        self.logger.info("공식 회의록 문서 생성 중...")
+        self.logger.info("공식 회의록 문서 생성 중... (LangChain)")
 
         system_prompt = """당신은 회의 내용을 바탕으로 공식적인 회의록(Meeting Minutes)을 작성하는 전문 비서입니다.
         다음 형식을 반드시 준수하여 문서를 생성해 주세요:
@@ -125,9 +144,9 @@ class ReportGenerator:
 
     def generate_action_items(self, transcript: str) -> str:
         """
-        대화록에서 액션 아이템을 추출합니다. (기존 기능)
+        대화록에서 액션 아이템을 추출합니다. (LangChain 기반)
         """
-        self.logger.info("액션 아이템 추출 중...")
+        self.logger.info("액션 아이템 추출 중... (LangChain)")
 
         system_prompt = """당신은 회의 내용에서 실행 가능한 액션 아이템을 추출하는 전문가입니다.
         다음 기준에 따라 액션 아이템을 식별해주세요:
@@ -149,9 +168,9 @@ class ReportGenerator:
 
     def analyze_sentiment(self, transcript: str) -> str:
         """
-        회의 분위기와 참석자들의 감정을 분석합니다. (기존 기능)
+        회의 분위기와 참석자들의 감정을 분석합니다. (LangChain 기반)
         """
-        self.logger.info("회의 분위기 분석 중...")
+        self.logger.info("회의 분위기 분석 중... (LangChain)")
 
         system_prompt = """당신은 회의 분위기와 참석자들의 감정을 분석하는 전문가입니다.
         대화의 톤, 의견 충돌, 합의 정도, 전반적인 분위기를 객관적으로 분석해주세요."""
@@ -169,9 +188,9 @@ class ReportGenerator:
 
     def generate_follow_up_questions(self, transcript: str) -> str:
         """
-        회의 내용을 바탕으로 후속 질문을 생성합니다. (기존 기능)
+        회의 내용을 바탕으로 후속 질문을 생성합니다. (LangChain 기반)
         """
-        self.logger.info("후속 질문 생성 중...")
+        self.logger.info("후속 질문 생성 중... (LangChain)")
 
         system_prompt = """당신은 회의 내용을 분석하여 후속 논의가 필요한 질문들을 생성하는 전문가입니다.
         미해결 이슈, 추가 검토가 필요한 사항, 명확화가 필요한 내용을 중심으로 질문을 만들어주세요."""
@@ -187,13 +206,13 @@ class ReportGenerator:
 """
         return self._call_llm(system_prompt, user_prompt)
 
-    # --- [신규 기능 6개 (Git + Local Merge)] ---
+    # --- [신규 기능 6개] ---
 
     def extract_keywords(self, transcript: str) -> str:
         """
-        대화록에서 핵심 키워드를 추출합니다. (Git 'e319...' 버전 기준)
+        대화록에서 핵심 키워드를 추출합니다. (LangChain 기반)
         """
-        self.logger.info("핵심 키워드 추출 중...")
+        self.logger.info("핵심 키워드 추출 중... (LangChain)")
 
         system_prompt = """당신은 텍스트에서 핵심 키워드를 추출하는 전문가입니다.
 다음 규칙을 엄격히 준수하여 키워드만 추출하세요:
@@ -220,9 +239,9 @@ class ReportGenerator:
 
     def classify_topics(self, transcript: str) -> str:
         """
-        대화록의 주제를 분류하고 카테고리화합니다. (Git 'e319...' 버전 신규)
+        대화록의 주제를 분류하고 카테고리화합니다. (LangChain 기반)
         """
-        self.logger.info("주제 분류 중...")
+        self.logger.info("주제 분류 중... (LangChain)")
 
         system_prompt = """당신은 회의 내용을 주제별로 분류하는 전문가입니다.
         대화록을 읽고 다음 작업을 수행해주세요:
@@ -257,9 +276,9 @@ class ReportGenerator:
 
     def analyze_by_speaker(self, transcript: str) -> str:
         """
-        발언자별로 내용을 요약하고 분석합니다. (Git 'e319...' 버전 신규)
+        발언자별로 내용을 요약하고 분석합니다. (LangChain 기반)
         """
-        self.logger.info("발언자별 분석 중...")
+        self.logger.info("발언자별 분석 중... (LangChain)")
 
         system_prompt = """당신은 회의 참석자들의 발언을 분석하는 전문가입니다.
         각 화자별로 다음을 분석해주세요:
@@ -291,9 +310,9 @@ class ReportGenerator:
 
     def classify_meeting_type(self, transcript: str) -> str:
         """
-        회의 유형을 분류합니다. (Git 'e319...' 버전 신규)
+        회의 유형을 분류합니다. (LangChain 기반)
         """
-        self.logger.info("회의 유형 분류 중...")
+        self.logger.info("회의 유형 분류 중... (LangChain)")
 
         system_prompt = """당신은 회의 유형을 분석하고 분류하는 전문가입니다.
         다음 카테고리 중에서 가장 적합한 유형을 선택하고 그 근거를 설명해주세요:
@@ -340,10 +359,9 @@ class ReportGenerator:
 
     def summarize_by_speaker(self, transcript: str) -> str:
         """
-        대화록을 바탕으로 화자별 주요 발언을 요약합니다. (로컬 DB 버전 신규)
-        (analyze_by_speaker보다 간단한 요약본)
+        대화록을 바탕으로 화자별 주요 발언을 요약합니다. (LangChain 기반)
         """
-        self.logger.info("화자별 간단 요약 생성 중...")
+        self.logger.info("화자별 간단 요약 생성 중... (LangChain)")
 
         system_prompt = """당신은 회의록을 바탕으로 각 화자의 주요 입장이나 발언을 요약하는 전문가입니다.
         [화자 N] 형태로 구분된 대화록을 보고, 각 화자별로 핵심 주장을 1~2줄로 요약해주세요.
@@ -367,22 +385,18 @@ class ReportGenerator:
 
     def calculate_engagement_score(self, transcript: str) -> str:
         """
-        회의 참여도를 점수화하고 분석합니다.
+        회의 참여도를 점수화하고 분석합니다. (LangChain 기반)
 
         Args:
             transcript: 대화록 텍스트 (화자별로 구분된 형태)
 
         Returns:
             참여도 점수 분석 결과 (JSON 형식 문자열)
-            - overall_score: 전체 참여도 점수 (0-100)
-            - speaker_scores: 화자별 점수
-            - engagement_distribution: 참여 균형도
-            - key_insights: 주요 발견사항
 
         Raises:
             ReportGeneratorError: 점수 계산 실패 시
         """
-        self.logger.info("회의 참여도 점수 계산 중...")
+        self.logger.info("회의 참여도 점수 계산 중... (LangChain)")
 
         system_prompt = """당신은 회의 참여도를 평가하는 전문 분석가입니다.
         회의록을 분석하여 참여도를 정량적으로 평가하고 점수화하세요.
@@ -421,22 +435,18 @@ class ReportGenerator:
 
     def generate_improvement_suggestions(self, transcript: str) -> str:
         """
-        회의 개선을 위한 구체적인 제안을 생성합니다.
+        회의 개선을 위한 구체적인 제안을 생성합니다. (LangChain 기반)
 
         Args:
             transcript: 대화록 텍스트 (화자별로 구분된 형태)
 
         Returns:
             회의 개선 제안 (구조화된 텍스트)
-            - 회의 진행 방식 개선
-            - 시간 관리 개선
-            - 참여도 향상 방안
-            - 실행 가능한 구체적 제안
 
         Raises:
             ReportGeneratorError: 제안 생성 실패 시
         """
-        self.logger.info("회의 개선 제안 생성 중...")
+        self.logger.info("회의 개선 제안 생성 중... (LangChain)")
 
         system_prompt = """당신은 효과적인 회의 진행을 위한 컨설턴트입니다.
         회의록을 분석하여 실행 가능한 구체적인 개선 제안을 제공하세요.
@@ -480,7 +490,7 @@ class ReportGenerator:
 
     def generate_embedding(self, text: str) -> list[float]:
         """
-        텍스트를 임베딩 벡터로 변환합니다.
+        텍스트를 임베딩 벡터로 변환합니다. (LangChain OpenAIEmbeddings 사용)
 
         Args:
             text: 임베딩으로 변환할 텍스트
@@ -492,11 +502,9 @@ class ReportGenerator:
             ReportGeneratorError: 임베딩 생성 실패 시
         """
         try:
-            response = self.client.embeddings.create(
-                model="text-embedding-3-small",
-                input=text
-            )
-            return response.data[0].embedding
+            # LangChain의 OpenAIEmbeddings.embed_query() 사용
+            embedding = self.embeddings.embed_query(text)
+            return embedding
         except Exception as e:
             self.logger.error(f"임베딩 생성 오류: {e}")
             raise ReportGeneratorError(f"임베딩 생성 중 오류가 발생했습니다: {e}")
