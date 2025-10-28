@@ -8,7 +8,7 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# pip 최신화 후 종속성 설치
+# pip 최신화 후 종속성 설치 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
